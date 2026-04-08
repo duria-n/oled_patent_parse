@@ -336,7 +336,7 @@ class MinerUPatentParser(BasePDFParser):
                 biblio_provider=self.biblio_provider,
                 keep_raw=self.keep_raw,
             )
-            return result is not None
+            return result is not None and result.exists()
         except Exception as exc:
             logger.warning("后处理失败: %s (%s)", pdf_path.name, exc)
             return False

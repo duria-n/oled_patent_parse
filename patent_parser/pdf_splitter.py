@@ -155,6 +155,16 @@ def _find_part_file(part_stem: str, output_dir: Path, suffix: str) -> Path | Non
         return hits[0]
     return None
 
+def _rewrite_img_path(img_path: str, part_stem: str) -> str:
+    if not img_path:
+        return img_path
+    p = img_path.replace("\\", "/")
+    for prefix in ("images/", "figures/", "equations/"):
+        idx = p.find(prefix)
+        if idx >= 0:
+            base = p[idx + len(prefix):]
+            return f"{prefix}{part_stem}_{base}"
+    return img_path
 
 def merge_content_list_parts(
     part_paths: list[Path],
@@ -187,9 +197,12 @@ def merge_content_list_parts(
             if "page_idx" in item and isinstance(item["page_idx"], int):
                 item["page_idx"] += page_offset
                 max_page = max(max_page, item["page_idx"])
-        if max_page >= 0:
-            page_offset = max_page + 1
-        merged_list.extend(data)
+
+            if isinstance(item.get("img_path"), str):
+                item["img_path"] = _rewrite_img_path(item["img_path"], part_stem)
+                if max_page >= 0:
+                    page_offset = max_page + 1
+                merged_list.extend(data)
 
     if require_all_parts and missing_parts:
         logger.error("存在缺失分片 content_list，不生成合并文件: %s", ", ".join(missing_parts))

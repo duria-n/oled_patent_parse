@@ -261,12 +261,24 @@ def subprocess_parse_one_smart(
         merged = merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
         merged_content = merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
         merged_middle = merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
-        if merged is not None and merged.exists() and merged_content is not None and merged_middle is not None:
-            logger.info("  合并完成 (%d/%d 片): %s",
-                        len(part_paths) - len(failed_parts), len(part_paths), merged)
-            return True, "", warnings
+        ok_md =  merged is not None and merged.exists()
+        ok_content = merged_content is not None and merged_content.exists()
+        ok_middle = merged_middle is not None and merged_middle.exists()
+        if ok_md and ok_middle and ok_middle:
+            return True, ""
+        missing = []
+        if not ok_md:
+            missing.append("md")
+        if not ok_middle:
+            missing.append("middle_json")
+        if not ok_content:
+            missing.append("content_list.json")           
+        # if merged is not None and merged.exists() and merged_content is not None and merged_middle is not None:
+        #     logger.info("  合并完成 (%d/%d 片): %s",
+        #                 len(part_paths) - len(failed_parts), len(part_paths), merged)
+        #     return True, "", warnings
 
-        logger.error("  合并失败或不完整: %s", pdf_path.name)
+        logger.error(f" {missing}  合并失败或不完整: %s", pdf_path.name)
         return False, "分片合并失败或缺失 md/content_list/middle", warnings
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

@@ -155,7 +155,8 @@ _EXAMPLE_KEYWORDS = {
     "device_example": [r"\bdevice\s+example\b", r"器件例"],
     "comparative_example": [r"\bcomparative\s+example\b", r"对比例"],
     "effect_statement": [r"\beffect\b", r"效果", r"有益效果"],
-    "example": [r"\bexample\b", r"实施例", r"例"],
+    # "example": [r"\bexample\b", r"实施例", r"例"],
+    "example": [r"\bexample\s*\d+\b", r"实施例\s*[0-9A-Za-z\-]+"] ,
 }
 
 _METRIC_KEYWORDS = [
