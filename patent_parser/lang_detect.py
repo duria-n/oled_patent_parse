@@ -63,12 +63,13 @@ def detect_pdf_language(
                        前缀不匹配时使用列表中的第一个作为回退。
 
     Returns:
-        (lang, is_scanned): lang 为 MinerU 语言代码，is_scanned 为 True 时
-        表示扫描件，应使用 OCR 方法解析。
+        (lang, is_scanned, lang_source): lang 为 MinerU 语言代码，is_scanned 为 True 时
+        表示扫描件，应使用 OCR 方法解析；lang_source 表示判定来源（wipo/prefix/fallback）。
     """
     fallback = allowed_langs[0] if allowed_langs else "en"
 
     prefix_lang = _detect_lang_by_filename(pdf_path, allowed_langs)
+    wipo_pub_lang = None
 
     # WO 优先使用官方 publication_language
     lang_source = "fallback"
@@ -76,11 +77,11 @@ def detect_pdf_language(
         pub_no = normalize_wo_pubno(pdf_path.stem) or pdf_path.stem
         meta = wipo_provider.lookup(pub_no)
         if meta and meta.publication_language:
+            wipo_pub_lang = meta.publication_language
             mapped = WIPO_LANG_MAP.get(meta.publication_language)
             if mapped and (not allowed_langs or mapped in allowed_langs):
                 lang = mapped
                 lang_source = "wipo"
-                logger.info("WO 官方语言 %s -> MinerU %s (%s)", meta.publication_language, mapped, pdf_path.name)
             else:
                 lang = prefix_lang if prefix_lang else fallback
         else:
@@ -90,6 +91,14 @@ def detect_pdf_language(
 
     if prefix_lang and lang == prefix_lang and lang_source != "wipo":
         lang_source = "prefix"
+    if lang_source == "wipo":
+        logger.info(
+            "根据 WIPO 官方元数据判断 %s 语言: %s (publication_language=%s)",
+            pdf_path.name,
+            lang,
+            wipo_pub_lang or "unknown",
+        )
+    elif lang_source == "prefix":
         logger.info("根据文件名前缀判断 %s 语言: %s", pdf_path.name, lang)
     else:
         logger.warning("无法从文件名 %s 判断语言，使用默认语言 %s", pdf_path.name, fallback)

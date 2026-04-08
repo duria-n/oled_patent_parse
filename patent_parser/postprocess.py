@@ -213,6 +213,10 @@ _ROLE_KEYWORDS = [
     "host", "dopant", "emitter", "acceptor", "donor",
     "hole transport", "electron transport", "injection",
 ]
+_ROLE_PATTERNS = []
+for _r in _ROLE_KEYWORDS:
+    _role_pat = re.escape(_r).replace(r"\ ", r"\s+")
+    _ROLE_PATTERNS.append((_r, re.compile(rf"\b{_role_pat}\b", re.I)))
 
 _UNIT_RE = re.compile(
     r"(?P<value>[-+]?\d+(?:\.\d+)?(?:\s*×\s*10\^[-+]?\d+)?)\s*(?P<unit>"
@@ -444,8 +448,8 @@ def _extract_entities(text: str) -> list[dict]:
                 "span": [m.start(), m.end()],
             })
 
-    for role in _ROLE_KEYWORDS:
-        for m in re.finditer(re.escape(role), lower):
+    for role, pat in _ROLE_PATTERNS:
+        for m in pat.finditer(text):
             entities.append({
                 "type": "role",
                 "value": role,

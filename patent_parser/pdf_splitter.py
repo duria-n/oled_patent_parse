@@ -179,6 +179,7 @@ def merge_content_list_parts(
 
     merged_list: list[dict] = []
     missing_parts: list[str] = []
+    invalid_parts: list[str] = []
     page_offset = 0
 
     for part_path in sorted(part_paths, key=_natural_sort_key):
@@ -188,24 +189,52 @@ def merge_content_list_parts(
             missing_parts.append(part_stem)
             logger.warning("分片 %s 未找到 content_list 输出", part_stem)
             continue
-        data = json.loads(part_json.read_text(encoding="utf-8"))
-        if not isinstance(data, list):
-            logger.warning("分片 %s content_list 格式异常", part_stem)
+        try:
+            data = json.loads(part_json.read_text(encoding="utf-8"))
+        except Exception as exc:
+            invalid_parts.append(part_stem)
+            logger.warning("分片 %s content_list 读取失败: %s", part_stem, exc)
             continue
+        if not isinstance(data, list):
+            invalid_parts.append(part_stem)
+            logger.warning("分片 %s content_list 格式异常：根节点不是 list", part_stem)
+            continue
+        part_items: list[dict] = []
         max_page = -1
         for item in data:
-            if "page_idx" in item and isinstance(item["page_idx"], int):
-                item["page_idx"] += page_offset
-                max_page = max(max_page, item["page_idx"])
-
-            if isinstance(item.get("img_path"), str):
-                item["img_path"] = _rewrite_img_path(item["img_path"], part_stem)
+            if not isinstance(item, dict):
+                invalid_parts.append(part_stem)
+                logger.warning("分片 %s content_list 项格式异常：存在非 dict 项", part_stem)
+                part_items = []
+                break
+            page_idx = item.get("page_idx")
+            if page_idx is not None and not isinstance(page_idx, int):
+                invalid_parts.append(part_stem)
+                logger.warning("分片 %s content_list 项格式异常：page_idx 非 int", part_stem)
+                part_items = []
+                break
+            item_copy = dict(item)
+            if isinstance(page_idx, int):
+                item_copy["page_idx"] = page_idx + page_offset
+                max_page = max(max_page, item_copy["page_idx"])
+            if isinstance(item_copy.get("img_path"), str):
+                item_copy["img_path"] = _rewrite_img_path(item_copy["img_path"], part_stem)
+            part_items.append(item_copy)
+        if not part_items and data:
+            continue
         if max_page >= 0:
             page_offset = max_page + 1
-        merged_list.extend(data)
+        merged_list.extend(part_items)
 
-    if require_all_parts and missing_parts:
-        logger.error("存在缺失分片 content_list，不生成合并文件: %s", ", ".join(missing_parts))
+    if require_all_parts and (missing_parts or invalid_parts):
+        missing_parts = list(dict.fromkeys(missing_parts))
+        invalid_parts = list(dict.fromkeys(invalid_parts))
+        detail = []
+        if missing_parts:
+            detail.append(f"缺失分片: {', '.join(missing_parts)}")
+        if invalid_parts:
+            detail.append(f"坏分片: {', '.join(invalid_parts)}")
+        logger.error("content_list 合并失败，不生成文件: %s", " | ".join(detail))
         merged_json.unlink(missing_ok=True)
         return None
 
@@ -227,6 +256,7 @@ def merge_middle_json_parts(
 
     merged_pages: list[dict] = []
     missing_parts: list[str] = []
+    invalid_parts: list[str] = []
     page_offset = 0
     backend = None
     version = None
@@ -238,19 +268,56 @@ def merge_middle_json_parts(
             missing_parts.append(part_stem)
             logger.warning("分片 %s 未找到 middle.json 输出", part_stem)
             continue
-        data = json.loads(part_json.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(part_json.read_text(encoding="utf-8"))
+        except Exception as exc:
+            invalid_parts.append(part_stem)
+            logger.warning("分片 %s middle.json 读取失败: %s", part_stem, exc)
+            continue
+        if not isinstance(data, dict):
+            invalid_parts.append(part_stem)
+            logger.warning("分片 %s middle.json 格式异常：根节点不是 dict", part_stem)
+            continue
         pages = data.get("pdf_info", [])
+        if not isinstance(pages, list):
+            invalid_parts.append(part_stem)
+            logger.warning("分片 %s middle.json 格式异常：pdf_info 不是 list", part_stem)
+            continue
+        part_pages: list[dict] = []
+        broken = False
         for page in pages:
-            if "page_idx" in page and isinstance(page["page_idx"], int):
-                page["page_idx"] += page_offset
-        if pages:
-            page_offset += len(pages)
-        merged_pages.extend(pages)
+            if not isinstance(page, dict):
+                invalid_parts.append(part_stem)
+                logger.warning("分片 %s middle.json 页项异常：存在非 dict 页", part_stem)
+                broken = True
+                break
+            page_copy = dict(page)
+            page_idx = page_copy.get("page_idx")
+            if page_idx is not None and not isinstance(page_idx, int):
+                invalid_parts.append(part_stem)
+                logger.warning("分片 %s middle.json 页项异常：page_idx 非 int", part_stem)
+                broken = True
+                break
+            if isinstance(page_idx, int):
+                page_copy["page_idx"] = page_idx + page_offset
+            part_pages.append(page_copy)
+        if broken:
+            continue
+        if part_pages:
+            page_offset += len(part_pages)
+        merged_pages.extend(part_pages)
         backend = backend or data.get("_backend")
         version = version or data.get("_version_name")
 
-    if require_all_parts and missing_parts:
-        logger.error("存在缺失分片 middle.json，不生成合并文件: %s", ", ".join(missing_parts))
+    if require_all_parts and (missing_parts or invalid_parts):
+        missing_parts = list(dict.fromkeys(missing_parts))
+        invalid_parts = list(dict.fromkeys(invalid_parts))
+        detail = []
+        if missing_parts:
+            detail.append(f"缺失分片: {', '.join(missing_parts)}")
+        if invalid_parts:
+            detail.append(f"坏分片: {', '.join(invalid_parts)}")
+        logger.error("middle.json 合并失败，不生成文件: %s", " | ".join(detail))
         merged_json.unlink(missing_ok=True)
         return None
 
