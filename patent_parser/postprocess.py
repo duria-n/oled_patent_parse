@@ -26,8 +26,8 @@ _CLAIM_DEP_RE = re.compile(
     r"(\d+(?:\s*(?:to|至|-|and|or|、|和)\s*\d+)*)",
     re.I,
 )
-_REF_NUM_RE = re.compile(r"([A-Za-z\u4e00-\u9fa5][A-Za-z\u4e00-\u9fa5\\s\\-]*)\s*\\((\\d+)\\)")
-_INID_RE = re.compile(r"^[\[\(](\d{2})[\]\)]\s*(.*)$")
+_REF_NUM_RE = re.compile(r"([A-Za-z\u4e00-\u9fa5][A-Za-z\u4e00-\u9fa5\s\-]*)\s*\((\d+)\)")
+_INID_RE = re.compile(r"^\s*[\[\(](\d{2})[\]\)]\s*(.*)$")
 
 
 _SECTION_KEYWORDS = {
@@ -99,12 +99,12 @@ _UNIT_RE = re.compile(
 
 _MATERIAL_RE = re.compile(
     r"\b("
-    r"(?:[A-Z][a-z]?\\d+)+"  # 化学式，如 Alq3
-    r"|(?:[A-Z]{2,}\\d+)"    # 大写缩写 + 数字，如 NPB1
-    r"|(?:[A-Z]{2,}[A-Za-z]*\\d+)"  # 大写缩写混合数字
-    r"|(?:[A-Z][A-Za-z]{1,}\\d+)"   # 可能的材料缩写 + 数字
-    r"|(?:[A-Z]{2,}[A-Za-z0-9\\-]{1,})"  # NPB, CBP 等
-    r")\\b"
+    r"(?:[A-Z][a-z]?\d+)+"  # 化学式，如 Alq3
+    r"|(?:[A-Z]{2,}\d+)"    # 大写缩写 + 数字，如 NPB1
+    r"|(?:[A-Z]{2,}[A-Za-z]*\d+)"  # 大写缩写混合数字
+    r"|(?:[A-Z][A-Za-z]{1,}\d+)"   # 可能的材料缩写 + 数字
+    r"|(?:[A-Z]{2,}[A-Za-z0-9\-]{1,})"  # NPB, CBP 等
+    r")\b"
 )
 _MATERIAL_STOP = {"FIG", "TABLE", "EXAMPLE", "OLED", "PCT", "WO", "US", "EP"}
 
@@ -426,7 +426,7 @@ def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None
 
 
 def _extract_example_id(text: str) -> str | None:
-    m = re.search(r"(?:实施例|例|example)\s*([\\dA-Za-z]+)", text, re.I)
+    m = re.search(r"(?:实施例|例|example)\s*([\dA-Za-z]+)", text, re.I)
     if not m:
         return None
     return m.group(1)
@@ -437,24 +437,19 @@ def _extract_claim_depends(text: str) -> list[int]:
     if not m:
         return []
     raw = m.group(1)
-    nums = []
-    parts = re.split(r"(?:to|至|-|and|or|、|和)", raw, flags=re.I)
-    parts = [p.strip() for p in parts if p.strip()]
-    if not parts:
-        return []
-    # 支持范围（如 1-3）
-    range_m = re.match(r"(\\d+)\\s*(?:to|至|-)\\s*(\\d+)", raw, re.I)
-    if range_m:
-        start = int(range_m.group(1))
-        end = int(range_m.group(2))
-        if start <= end:
-            return list(range(start, end + 1))
-    for p in parts:
+    nums: set[int] = set()
+    # 支持范围（如 1-3 / 1至3）
+    for rm in re.finditer(r"(\d+)\s*(?:to|至|-)\s*(\d+)", raw, re.I):
+        start, end = int(rm.group(1)), int(rm.group(2))
+        if start <= end and (end - start) < 50:
+            nums.update(range(start, end + 1))
+    # 处理散点数字（如 1,2 and 4-6）
+    for num_str in re.findall(r"\d+", raw):
         try:
-            nums.append(int(p))
+            nums.add(int(num_str))
         except ValueError:
             continue
-    return sorted(set(nums))
+    return sorted(nums)
 
 
 def _build_claim_tree(blocks: list[dict]) -> dict:

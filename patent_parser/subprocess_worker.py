@@ -97,7 +97,15 @@ do_parse(
             logger.error("解析超时（30min），强制终止: %s", pdf_path_str)
             # 杀整个进程组，避免 MinerU 子进程遗留
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                if sys.platform != "win32":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
             except Exception:
                 proc.kill()
             proc.wait()
@@ -105,7 +113,15 @@ do_parse(
         except KeyboardInterrupt:
             logger.warning("收到中断，终止子进程: %s", pdf_path_str)
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                if sys.platform != "win32":
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                else:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
             except Exception:
                 proc.kill()
             proc.wait()
