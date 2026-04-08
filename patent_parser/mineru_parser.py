@@ -88,8 +88,6 @@ class MinerUPatentParser(BasePDFParser):
 
     def _resolve_lang(self, pdf_path: Path) -> tuple[str, bool]:
         """返回 (语言代码, 是否为扫描件)。"""
-        if len(self.langs) == 1:
-            return self.langs[0], False
         return detect_pdf_language(pdf_path, allowed_langs=self.langs, wipo_provider=self.wipo_provider)
 
     def prepare_output_dir(self, subdir: Path) -> Path:

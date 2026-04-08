@@ -4,6 +4,7 @@
 解析后再将各分片产生的 .md 合并为一个以原始文件名命名的 .md 文件。
 """
 
+import json
 import re
 import shutil
 import tempfile
@@ -136,6 +137,118 @@ def _find_md_for_part(part_stem: str, output_dir: Path, merged_md: Path) -> Path
         return hits[0]
 
     return None
+
+
+def _find_part_file(part_stem: str, output_dir: Path, suffix: str) -> Path | None:
+    part_out_dir = output_dir / part_stem
+    candidate = part_out_dir / f"{part_stem}{suffix}"
+    if candidate.exists():
+        return candidate
+    if part_out_dir.is_dir():
+        hits = [p for p in part_out_dir.rglob(f"*{suffix}") if p.stem == f"{part_stem}{suffix[:-len(suffix)]}"]
+        if hits:
+            hits.sort(key=lambda p: (len(p.parts), len(str(p))))
+            return hits[0]
+    hits = [p for p in output_dir.rglob(f"*{suffix}") if p.stem == f"{part_stem}{suffix[:-len(suffix)]}"]
+    if hits:
+        hits.sort(key=lambda p: (len(p.parts), len(str(p))))
+        return hits[0]
+    return None
+
+
+def merge_content_list_parts(
+    part_paths: list[Path],
+    output_dir: Path,
+    original_stem: str,
+    *,
+    require_all_parts: bool = True,
+) -> Path | None:
+    merged_dir = output_dir / original_stem
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    merged_json = merged_dir / f"{original_stem}_content_list.json"
+
+    merged_list: list[dict] = []
+    missing_parts: list[str] = []
+    page_offset = 0
+
+    for part_path in sorted(part_paths, key=_natural_sort_key):
+        part_stem = part_path.stem
+        part_json = _find_part_file(part_stem, output_dir, "_content_list.json")
+        if part_json is None:
+            missing_parts.append(part_stem)
+            logger.warning("分片 %s 未找到 content_list 输出", part_stem)
+            continue
+        data = json.loads(part_json.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            logger.warning("分片 %s content_list 格式异常", part_stem)
+            continue
+        max_page = -1
+        for item in data:
+            if "page_idx" in item and isinstance(item["page_idx"], int):
+                item["page_idx"] += page_offset
+                max_page = max(max_page, item["page_idx"])
+        if max_page >= 0:
+            page_offset = max_page + 1
+        merged_list.extend(data)
+
+    if require_all_parts and missing_parts:
+        logger.error("存在缺失分片 content_list，不生成合并文件: %s", ", ".join(missing_parts))
+        merged_json.unlink(missing_ok=True)
+        return None
+
+    merged_json.write_text(json.dumps(merged_list, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("合并 content_list -> %s", merged_json)
+    return merged_json
+
+
+def merge_middle_json_parts(
+    part_paths: list[Path],
+    output_dir: Path,
+    original_stem: str,
+    *,
+    require_all_parts: bool = True,
+) -> Path | None:
+    merged_dir = output_dir / original_stem
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    merged_json = merged_dir / f"{original_stem}_middle.json"
+
+    merged_pages: list[dict] = []
+    missing_parts: list[str] = []
+    page_offset = 0
+    backend = None
+    version = None
+
+    for part_path in sorted(part_paths, key=_natural_sort_key):
+        part_stem = part_path.stem
+        part_json = _find_part_file(part_stem, output_dir, "_middle.json")
+        if part_json is None:
+            missing_parts.append(part_stem)
+            logger.warning("分片 %s 未找到 middle.json 输出", part_stem)
+            continue
+        data = json.loads(part_json.read_text(encoding="utf-8"))
+        pages = data.get("pdf_info", [])
+        for page in pages:
+            if "page_idx" in page and isinstance(page["page_idx"], int):
+                page["page_idx"] += page_offset
+        if pages:
+            page_offset += len(pages)
+        merged_pages.extend(pages)
+        backend = backend or data.get("_backend")
+        version = version or data.get("_version_name")
+
+    if require_all_parts and missing_parts:
+        logger.error("存在缺失分片 middle.json，不生成合并文件: %s", ", ".join(missing_parts))
+        merged_json.unlink(missing_ok=True)
+        return None
+
+    merged = {"pdf_info": merged_pages}
+    if backend:
+        merged["_backend"] = backend
+    if version:
+        merged["_version_name"] = version
+    merged_json.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("合并 middle.json -> %s", merged_json)
+    return merged_json
 
 
 def _replace_local_resource_refs(content: str, rename_map: dict[str, str]) -> str:

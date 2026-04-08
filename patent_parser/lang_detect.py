@@ -11,10 +11,10 @@ from .wipo_metadata import WIPOMetadataProvider, normalize_wo_pubno
 def _detect_lang_by_filename(pdf_path: Path, allowed_langs: list[str] | None) -> str | None:
     """根据专利文件名前缀判断语言，命中则返回 MinerU 语言代码，否则返回 None。"""
     stem = pdf_path.stem
-    m = re.match(r"^([A-Z]{2})", stem)
+    m = re.match(r"^([A-Z]{2})", stem, re.I)
     if not m:
         return None
-    prefix = m.group(1)
+    prefix = m.group(1).upper()
     lang = PATENT_PREFIX_LANG.get(prefix)
     if lang is None:
         return None
@@ -43,7 +43,8 @@ def _is_scanned_pdf(pdf_path: Path) -> bool:
                 return False
         return len(text.strip()) == 0
     except Exception:
-        return False
+        # 保守：异常时按扫描件处理，避免漏 OCR
+        return True
     finally:
         for lg, lvl in old_levels.items():
             lg.setLevel(lvl)

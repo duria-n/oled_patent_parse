@@ -196,6 +196,8 @@ def subprocess_parse_one_smart(
     get_page_count = _splitter.get_page_count
     split_pdf = _splitter.split_pdf
     merge_markdown_parts = _splitter.merge_markdown_parts
+    merge_content_list_parts = _splitter.merge_content_list_parts
+    merge_middle_json_parts = _splitter.merge_middle_json_parts
 
     pdf_path = Path(pdf_path_str)
     output_dir = Path(output_dir_str)
@@ -248,9 +250,13 @@ def subprocess_parse_one_smart(
         if failed_parts:
             logger.error("  存在失败分片，跳过正式合并: %s", ", ".join(failed_parts))
             merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+            merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+            merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
             return False, first_error or f"{len(failed_parts)} 个分片解析失败"
 
         merged = merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+        merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+        merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
         if merged is not None and merged.exists():
             logger.info("  合并完成 (%d/%d 片): %s",
                         len(part_paths) - len(failed_parts), len(part_paths), merged)

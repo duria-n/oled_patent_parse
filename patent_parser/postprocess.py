@@ -81,6 +81,10 @@ if BaseModel:
         depends_on: Optional[list[int]] = None
         claim_no: Optional[int] = None
         raw: Optional[dict[str, Any]] = None
+        table_id: Optional[str] = None
+        table_no: Optional[str] = None
+        figure_id: Optional[str] = None
+        figure_no: Optional[str] = None
 
     class TableModel(BaseModel):
         model_config = ConfigDict(extra="ignore") if ConfigDict else {}
@@ -158,6 +162,13 @@ _METRIC_KEYWORDS = [
     "eqe", "ce", "pe", "current efficiency", "power efficiency", "luminance",
     "t50", "lt50", "lifetime", "turn-on voltage", "voltage", "cie",
 ]
+_METRIC_PATTERNS = []
+for _m in _METRIC_KEYWORDS:
+    if _m in {"ce", "pe"}:
+        _METRIC_PATTERNS.append((_m, re.compile(rf"\\b{re.escape(_m)}\\b", re.I)))
+    else:
+        pattern = re.escape(_m).replace("\\ ", r"\\s+")
+        _METRIC_PATTERNS.append((_m, re.compile(rf"\\b{pattern}\\b", re.I)))
 _METRIC_UNIT_HINTS = {
     "eqe": {"%"},
     "ce": {"cd/a", "cd/a."},
@@ -362,14 +373,24 @@ def _extract_entities(text: str) -> list[dict]:
     if not text:
         return entities
 
+    def _parse_value(raw: str) -> float | None:
+        raw_norm = raw.replace("×", "x").replace(" ", "")
+        sci = re.match(r"^([+-]?\d+(?:\.\d+)?)[xX]10\^?([+-]?\d+)$", raw_norm)
+        if sci:
+            try:
+                return float(sci.group(1)) * (10 ** int(sci.group(2)))
+            except ValueError:
+                return None
+        try:
+            return float(raw_norm)
+        except ValueError:
+            return None
+
     for m in _UNIT_RE.finditer(text):
         raw_val = m.group("value")
         unit = m.group("unit")
         span = [m.start(), m.end()]
-        try:
-            val = float(raw_val.replace("×", "x").replace("^", "").replace(" ", ""))
-        except ValueError:
-            val = None
+        val = _parse_value(raw_val)
         entities.append({
             "type": "value",
             "value": raw_val,
@@ -394,8 +415,8 @@ def _extract_entities(text: str) -> list[dict]:
             "value_pair": [float(x), float(y)],
             "span": [m.start(), m.end()],
         })
-    for metric in _METRIC_KEYWORDS:
-        for m in re.finditer(re.escape(metric), lower):
+    for metric, pat in _METRIC_PATTERNS:
+        for m in pat.finditer(text):
             entities.append({
                 "type": "metric",
                 "value": metric,

@@ -49,7 +49,7 @@ class BasePDFParser(ABC):
         result: list[Path] = []
         
         # 修复：先检查根目录自身是否含有 PDF
-        if any(self.input_root.glob("*.pdf")):
+        if self._has_pdf(self.input_root):
             result.append(self.input_root)
             
         self._collect_pdf_dirs(self.input_root, is_root=True, result=result)
@@ -75,14 +75,25 @@ class BasePDFParser(ABC):
                 continue
                 
             # 如果该目录直接含有 PDF，记录它
-            if any(entry.glob("*.pdf")):
+            if self._has_pdf(entry):
                 result.append(entry)
                 
             # 修复：移除 else，无论当前目录有没有 PDF，都强制向下递归查找更深层
             self._collect_pdf_dirs(entry, is_root=False, result=result)
 
     def collect_pdfs(self, subdir: Path) -> list[Path]:
-        return sorted(subdir.glob("*.pdf"))
+        pdfs = [p for p in subdir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+        return sorted(pdfs, key=lambda p: p.name.lower())
+
+    @staticmethod
+    def _has_pdf(directory: Path) -> bool:
+        try:
+            for p in directory.iterdir():
+                if p.is_file() and p.suffix.lower() == ".pdf":
+                    return True
+        except PermissionError:
+            return False
+        return False
 
     @abstractmethod
     def prepare_output_dir(self, subdir: Path) -> Path:
