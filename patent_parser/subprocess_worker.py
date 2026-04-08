@@ -233,6 +233,7 @@ def subprocess_parse_one_smart(
 
     tmp_dir = part_paths[0].parent
     try:
+        warnings: dict = {}
         failed_parts: list[str] = []
         first_error: str = ""
         for j, part_path in enumerate(part_paths, 1):
@@ -264,8 +265,10 @@ def subprocess_parse_one_smart(
         ok_md =  merged is not None and merged.exists()
         ok_content = merged_content is not None and merged_content.exists()
         ok_middle = merged_middle is not None and merged_middle.exists()
-        if ok_md and ok_middle and ok_middle:
-            return True, ""
+        if ok_md and ok_content and ok_middle:
+            logger.info("  合并完成 (%d/%d 片): %s",
+                        len(part_paths) - len(failed_parts), len(part_paths), merged)
+            return True, "", warnings
         missing = []
         if not ok_md:
             missing.append("md")

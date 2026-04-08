@@ -166,10 +166,10 @@ _METRIC_KEYWORDS = [
 _METRIC_PATTERNS = []
 for _m in _METRIC_KEYWORDS:
     if _m in {"ce", "pe"}:
-        _METRIC_PATTERNS.append((_m, re.compile(rf"\\b{re.escape(_m)}\\b", re.I)))
+        _METRIC_PATTERNS.append((_m, re.compile(rf"\b{re.escape(_m)}\b", re.I)))
     else:
-        pattern = re.escape(_m).replace("\\ ", r"\\s+")
-        _METRIC_PATTERNS.append((_m, re.compile(rf"\\b{pattern}\\b", re.I)))
+        pattern = re.escape(_m).replace(r"\ ", r"\s+")
+        _METRIC_PATTERNS.append((_m, re.compile(rf"\b{pattern}\b", re.I)))
 _METRIC_UNIT_HINTS = {
     "eqe": {"%"},
     "ce": {"cd/a", "cd/a."},
@@ -1075,6 +1075,25 @@ def build_structured_json(
         for rel in blk.get("relations", []):
             exp["performance"].append(rel.get("relation_id"))
     output["experiments"] = list(experiments_map.values())
+    for exp in output["experiments"]:
+        perf = []
+        role = []
+        for rel_id in exp.get("performance", []):
+            rel = next(
+                (
+                    r for b in blocks for r in b.get("relations", [])
+                    if r.get("relation_id") == rel_id
+                ),
+                None,
+            )
+            if not rel:
+                continue
+            if rel.get("type") == "has_value":
+                perf.append(rel_id)
+            elif rel.get("type") == "has_role":
+                role.append(rel_id)
+        exp["performance_relations"] = perf
+        exp["role_relations"] = role
 
     # Pydantic 数据契约校验
     if BaseModel:

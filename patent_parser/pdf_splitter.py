@@ -200,9 +200,9 @@ def merge_content_list_parts(
 
             if isinstance(item.get("img_path"), str):
                 item["img_path"] = _rewrite_img_path(item["img_path"], part_stem)
-                if max_page >= 0:
-                    page_offset = max_page + 1
-                merged_list.extend(data)
+        if max_page >= 0:
+            page_offset = max_page + 1
+        merged_list.extend(data)
 
     if require_all_parts and missing_parts:
         logger.error("存在缺失分片 content_list，不生成合并文件: %s", ", ".join(missing_parts))

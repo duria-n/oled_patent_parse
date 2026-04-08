@@ -313,6 +313,9 @@ class MinerUPatentParser(BasePDFParser):
             shutil.copy2(md_file, dest_md)
 
             md_parent = md_file.parent
+            structured_json = md_parent / f"{md_file.stem}_structured.json"
+            if structured_json.exists() and structured_json.is_file():
+                shutil.copy2(structured_json, doc_target_dir / structured_json.name)
             for res_dir_name in ["images", "figures", "equations"]:
                 res_dir = md_parent / res_dir_name
                 if res_dir.exists() and res_dir.is_dir():
