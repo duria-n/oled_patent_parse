@@ -1,8 +1,10 @@
 """子进程隔离解析，防止 segfault 杀死主进程。"""
 
+import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -17,22 +19,34 @@ def subprocess_parse_one(pdf_path_str: str, output_dir_str: str, lang: str,
                          backend: str, parse_method: str,
                          formula_enable: bool, table_enable: bool,
                          gpu_id: int | None = None) -> tuple[bool, str]:
-    code = f"""\
+    # 通过临时脚本 + JSON 配置传参，避免 -c 动态拼接导致的特殊字符/注入问题
+    payload = {
+        "pdf_path": pdf_path_str,
+        "output_dir": output_dir_str,
+        "lang": lang,
+        "backend": backend,
+        "parse_method": parse_method,
+        "formula_enable": formula_enable,
+        "table_enable": table_enable,
+    }
+    script = """\
+import json
 import sys
 from pathlib import Path
 from mineru.cli.common import do_parse, read_fn
 
-pdf_path = Path({pdf_path_str!r})
+cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+pdf_path = Path(cfg["pdf_path"])
 pdf_bytes = read_fn(pdf_path)
 do_parse(
-    output_dir={output_dir_str!r},
+    output_dir=cfg["output_dir"],
     pdf_file_names=[pdf_path.stem],
     pdf_bytes_list=[pdf_bytes],
-    p_lang_list=[{lang!r}],
-    backend={backend!r},
-    parse_method={parse_method!r},
-    formula_enable={formula_enable!r},
-    table_enable={table_enable!r},
+    p_lang_list=[cfg["lang"]],
+    backend=cfg["backend"],
+    parse_method=cfg["parse_method"],
+    formula_enable=cfg["formula_enable"],
+    table_enable=cfg["table_enable"],
     f_dump_md=True,
     f_dump_middle_json=True,
     f_dump_model_output=False,
@@ -55,12 +69,25 @@ do_parse(
         mode="wb", suffix=".stderr", delete=False
     )
     stderr_path = Path(stderr_file.name)
+    cfg_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    )
+    cfg_path = Path(cfg_file.name)
+    cfg_file.write(json.dumps(payload, ensure_ascii=False))
+    cfg_file.close()
+    script_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    )
+    script_path = Path(script_file.name)
+    script_file.write(script)
+    script_file.close()
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-c", code],
+            [sys.executable, str(script_path), str(cfg_path)],
             stdout=subprocess.DEVNULL,
             stderr=stderr_file,
             env=env,
+            start_new_session=True,
         )
         stderr_file.close()
 
@@ -68,12 +95,19 @@ do_parse(
             proc.wait(timeout=1800)
         except subprocess.TimeoutExpired:
             logger.error("解析超时（30min），强制终止: %s", pdf_path_str)
-            proc.kill()
+            # 杀整个进程组，避免 MinerU 子进程遗留
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
             proc.wait()
             return False, "超时（> 30min）"
         except KeyboardInterrupt:
             logger.warning("收到中断，终止子进程: %s", pdf_path_str)
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
             proc.wait()
             raise
 
@@ -87,6 +121,8 @@ do_parse(
 
     finally:
         stderr_path.unlink(missing_ok=True)
+        cfg_path.unlink(missing_ok=True)
+        script_path.unlink(missing_ok=True)
 
 
 def _read_tail(path: Path, max_bytes: int) -> str:

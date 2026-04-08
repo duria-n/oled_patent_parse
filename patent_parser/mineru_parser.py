@@ -151,7 +151,7 @@ class MinerUPatentParser(BasePDFParser):
     def _parse_sequential(self, pending, output_dir, done):
         pending_total = len(pending)
         for i, (idx, pdf_path, lang, is_scanned) in enumerate(pending, 1):
-            gpu_id = self.gpu_ids[(i - 1) % len(self.gpu_ids)]
+            gpu_id = self.gpu_ids[0]
             method_info = "OCR（扫描件）" if is_scanned else self.parse_method
             logger.info("[%d/%d] 正在解析: %s (语言: %s, 方法: %s, GPU: %d)",
                         i, pending_total, pdf_path.name, lang, method_info, gpu_id)

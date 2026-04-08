@@ -66,19 +66,35 @@ _UNIT_RE = re.compile(
     re.I,
 )
 
-_MATERIAL_RE = re.compile(r"\b[A-Z][A-Za-z0-9\-]{2,}\b")
+_MATERIAL_RE = re.compile(
+    r"\b("
+    r"(?:[A-Z][a-z]?\\d+)+"  # 化学式，如 Alq3
+    r"|(?:[A-Z]{2,}\\d+)"    # 大写缩写 + 数字，如 NPB1
+    r"|(?:[A-Z]{2,}[A-Za-z]*\\d+)"  # 大写缩写混合数字
+    r"|(?:[A-Z][A-Za-z]{1,}\\d+)"   # 可能的材料缩写 + 数字
+    r"|(?:[A-Z]{2,}[A-Za-z0-9\\-]{1,})"  # NPB, CBP 等
+    r")\\b"
+)
 _MATERIAL_STOP = {"FIG", "TABLE", "EXAMPLE", "OLED", "PCT", "WO", "US", "EP"}
 
 
 class _SimpleHTMLTableParser(HTMLParser):
+    """支持嵌套表格的轻量解析器（忽略嵌套表格内容）。"""
+
     def __init__(self):
         super().__init__()
         self.rows: list[list[dict]] = []
         self._current_row: list[dict] | None = None
         self._current_cell: dict | None = None
         self._in_cell = False
+        self._table_depth = 0
 
     def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table_depth += 1
+            return
+        if self._table_depth > 1:
+            return
         if tag == "tr":
             self._current_row = []
         elif tag in ("td", "th"):
@@ -92,6 +108,12 @@ class _SimpleHTMLTableParser(HTMLParser):
             }
 
     def handle_endtag(self, tag):
+        if tag == "table":
+            if self._table_depth > 0:
+                self._table_depth -= 1
+            return
+        if self._table_depth > 1:
+            return
         if tag in ("td", "th") and self._current_row is not None and self._current_cell:
             self._current_cell["text"] = self._current_cell["text"].strip()
             self._current_row.append(self._current_cell)
@@ -102,6 +124,8 @@ class _SimpleHTMLTableParser(HTMLParser):
             self._current_row = None
 
     def handle_data(self, data):
+        if self._table_depth > 1:
+            return
         if self._in_cell and self._current_cell is not None:
             self._current_cell["text"] += data
 
