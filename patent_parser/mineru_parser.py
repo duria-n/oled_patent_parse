@@ -50,6 +50,7 @@ class MinerUPatentParser(BasePDFParser):
         wipo_metadata_path: str | None = None,
         postprocess_enable: bool = True,
         biblio_metadata_path: str | None = None,
+        keep_raw: bool = False,
     ):
         super().__init__(input_root, output_root)
         self.langs = langs if langs else ["ch", "chinese_cht", "japan", "en", "korean"]
@@ -60,6 +61,7 @@ class MinerUPatentParser(BasePDFParser):
         self.postprocess_enable = postprocess_enable
         self.wipo_provider = WIPOMetadataProvider(wipo_metadata_path)
         self.biblio_provider = BiblioMetadataProvider(biblio_metadata_path)
+        self.keep_raw = keep_raw
 
         total_gpus = _get_gpu_count()
         if gpu_ids is not None:
@@ -281,6 +283,7 @@ class MinerUPatentParser(BasePDFParser):
                 output_dir,
                 parse_method=parse_method,
                 biblio_provider=self.biblio_provider,
+                keep_raw=self.keep_raw,
             )
         except Exception as exc:
             logger.warning("后处理失败: %s (%s)", pdf_path.name, exc)

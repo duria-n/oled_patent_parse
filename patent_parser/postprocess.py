@@ -13,7 +13,7 @@ from .biblio_cache import BiblioMetadataProvider
 from .config import logger
 
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, ValidationError
     try:
         from pydantic import ConfigDict
     except Exception:
@@ -170,6 +170,12 @@ _METRIC_UNIT_HINTS = {
     "turn-on voltage": {"v"},
     "voltage": {"v"},
     "cie": set(),  # 通常是坐标对，无单位
+}
+CONFIDENCE_SCORES = {
+    "cie_coord_inline": 0.95,
+    "metric_unit_match": 0.85,
+    "nearest_metric": 0.65,
+    "nearest_role": 0.70,
 }
 _CIE_RE = re.compile(
     r"cie(?:\s*1931)?\s*"
@@ -477,10 +483,10 @@ def _bind_metric_values(
                 continue
             unit = val.get("unit")
             rule = "nearest_metric"
-            confidence = 0.65
+            confidence = CONFIDENCE_SCORES[rule]
             if best.get("value") == "cie" and val.get("value_pair"):
                 rule = "cie_coord_inline"
-                confidence = 0.95
+                confidence = CONFIDENCE_SCORES[rule]
             if unit:
                 unit_norm = unit.lower().replace(" ", "")
                 allowed = _METRIC_UNIT_HINTS.get(best["value"], set())
@@ -488,7 +494,7 @@ def _bind_metric_values(
                     continue
                 if allowed:
                     rule = "metric_unit_match"
-                    confidence = 0.85
+                    confidence = CONFIDENCE_SCORES[rule]
             distance = abs(vpos - best["span"][0])
             src_id = best.get("entity_id")
             tgt_id = val.get("entity_id")
@@ -549,7 +555,7 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                 "type": "has_role",
                 "source_entity_id": src_id,
                 "target_entity_id": tgt_id,
-                "confidence": 0.7,
+                "confidence": CONFIDENCE_SCORES["nearest_role"],
                 "rule": "nearest_role",
                 "distance": int(best_dist or 0),
                 "sentence_id": f"{base_id}_s{sid:03d}",
@@ -709,8 +715,10 @@ def build_structured_json(
     output_dir: Path,
     parse_method: str | None = None,
     biblio_provider: BiblioMetadataProvider | None = None,
+    keep_raw: bool = False,
 ) -> Path | None:
     stem = pdf_path.stem
+    safe_stem = "doc_" + re.sub(r"[^a-zA-Z0-9]", "_", stem)
     doc_root = output_dir / stem
     if parse_method:
         doc_dir = doc_root / parse_method
@@ -748,7 +756,7 @@ def build_structured_json(
         bbox_norm = item.get("bbox")
         page = page_info.get(page_idx) if page_idx is not None else None
 
-        block_id = f"{stem}_p{page_no}_b{idx}"
+        block_id = f"{safe_stem}_p{page_no}_b{idx}"
         base_prov = {
             "page_no": page_no,
             "source_file": str(pdf_path),
@@ -765,8 +773,8 @@ def build_structured_json(
             entities = _extract_entities(text)
             for ei, ent in enumerate(entities, 1):
                 ent["entity_id"] = f"{block_id}_e{ei:03d}"
-                if ent.get("type") == "material" and ent.get("canonical_id") is None:
-                    ent["canonical_id"] = None
+                if ent.get("type") == "material" and not ent.get("canonical_id"):
+                    ent["canonical_id"] = "PENDING_MAPPING"
             relations = _bind_metric_values(text, entities, base_id=block_id)
             relations.extend(_bind_material_roles(text, entities, base_id=block_id))
             for ri, rel in enumerate(relations, 1):
@@ -820,8 +828,8 @@ def build_structured_json(
                     ents = cell.get("entities") or []
                     for ei, ent in enumerate(ents, 1):
                         ent["entity_id"] = f"{table_id}_r{r_idx:03d}_c{c_idx:03d}_e{ei:03d}"
-                        if ent.get("type") == "material" and ent.get("canonical_id") is None:
-                            ent["canonical_id"] = None
+                        if ent.get("type") == "material" and not ent.get("canonical_id"):
+                            ent["canonical_id"] = "PENDING_MAPPING"
                     if ents:
                         cell["entities"] = ents
             cell_text = " ".join(
@@ -833,8 +841,8 @@ def build_structured_json(
             table_entities = _extract_entities(cell_text)
             for ei, ent in enumerate(table_entities, 1):
                 ent["entity_id"] = f"{table_id}_e{ei:03d}"
-                if ent.get("type") == "material" and ent.get("canonical_id") is None:
-                    ent["canonical_id"] = None
+                if ent.get("type") == "material" and not ent.get("canonical_id"):
+                    ent["canonical_id"] = "PENDING_MAPPING"
             table_units = _extract_table_units(table_struct.get("rows", []))
 
             tables.append({
@@ -986,6 +994,11 @@ def build_structured_json(
         if inid:
             output["metadata"] = inid | {"source": "inid"}
 
+    if not keep_raw:
+        for blk in output.get("blocks", []):
+            if isinstance(blk, dict) and "raw" in blk:
+                blk.pop("raw", None)
+
     # experiments 聚合（示例/对比/合成等）
     experiments_map: dict[str, dict[str, Any]] = {}
     for blk in blocks:
@@ -1011,8 +1024,19 @@ def build_structured_json(
 
     # Pydantic 数据契约校验
     if BaseModel:
-        doc = DocumentModel(**output)
-        output = doc.model_dump()
+        try:
+            doc = DocumentModel(**output)
+            output = doc.model_dump() if hasattr(doc, "model_dump") else doc.dict()
+        except ValidationError as ve:
+            logger.error(
+                "数据结构校验失败 [%s]:\n%s",
+                stem,
+                ve.json(indent=2) if hasattr(ve, "json") else str(ve),
+            )
+            return None
+        except Exception as exc:
+            logger.error("未知错误导致序列化失败 [%s]: %s", stem, str(exc))
+            return None
     else:
         logger.warning("未安装 pydantic，跳过数据契约校验")
 
