@@ -80,6 +80,7 @@ if BaseModel:
         example_id: Optional[str] = None
         depends_on: Optional[list[int]] = None
         claim_no: Optional[int] = None
+        raw: Optional[dict[str, Any]] = None
 
     class TableModel(BaseModel):
         model_config = ConfigDict(extra="ignore") if ConfigDict else {}
