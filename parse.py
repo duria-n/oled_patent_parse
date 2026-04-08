@@ -10,7 +10,7 @@ from patent_parser.mineru_parser import MinerUPatentParser
 
 logger = logging.getLogger("patent_parser")
 
-DEFAULT_LANGS = "ch,chinese_cht,japan,en,korean"
+DEFAULT_LANGS = "ch,chinese_cht,japan,en,korean,latin,cyrillic,arabic"
 
 
 def _parse_langs(value: str) -> list[str]:

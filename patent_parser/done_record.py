@@ -45,7 +45,7 @@ class DoneRecord:
         return entry is not None and entry.get("status") == "failed"
 
     def mark(self, pdf_name: str, lang: str, status: str = "done",
-             error_msg: str | None = None) -> None:
+             error_msg: str | None = None, **extra) -> None:
         entry: dict = {
             "lang": lang,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -54,6 +54,8 @@ class DoneRecord:
         if error_msg:
             # 截断过长的错误信息，避免 done.json 膨胀
             entry["error_msg"] = error_msg[:500]
+        for k, v in extra.items():
+            entry[k] = v
         self._data[pdf_name] = entry
         self._save()
 

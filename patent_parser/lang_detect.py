@@ -54,7 +54,7 @@ def detect_pdf_language(
     pdf_path: Path,
     allowed_langs: list[str] | None = None,
     wipo_provider: WIPOMetadataProvider | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str]:
     """根据专利文件名前缀判断语言，并检测是否为扫描件。
 
     Args:
@@ -71,6 +71,7 @@ def detect_pdf_language(
     prefix_lang = _detect_lang_by_filename(pdf_path, allowed_langs)
 
     # WO 优先使用官方 publication_language
+    lang_source = "fallback"
     if pdf_path.stem.upper().startswith("WO") and wipo_provider:
         pub_no = normalize_wo_pubno(pdf_path.stem) or pdf_path.stem
         meta = wipo_provider.lookup(pub_no)
@@ -78,6 +79,7 @@ def detect_pdf_language(
             mapped = WIPO_LANG_MAP.get(meta.publication_language)
             if mapped and (not allowed_langs or mapped in allowed_langs):
                 lang = mapped
+                lang_source = "wipo"
                 logger.info("WO 官方语言 %s -> MinerU %s (%s)", meta.publication_language, mapped, pdf_path.name)
             else:
                 lang = prefix_lang if prefix_lang else fallback
@@ -86,7 +88,8 @@ def detect_pdf_language(
     else:
         lang = prefix_lang if prefix_lang else fallback
 
-    if prefix_lang and lang == prefix_lang:
+    if prefix_lang and lang == prefix_lang and lang_source != "wipo":
+        lang_source = "prefix"
         logger.info("根据文件名前缀判断 %s 语言: %s", pdf_path.name, lang)
     else:
         logger.warning("无法从文件名 %s 判断语言，使用默认语言 %s", pdf_path.name, fallback)
@@ -95,4 +98,4 @@ def detect_pdf_language(
     if is_scanned:
         logger.info("%s 为扫描件，将使用 OCR 解析", pdf_path.name)
 
-    return lang, is_scanned
+    return lang, is_scanned, lang_source

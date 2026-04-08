@@ -162,22 +162,24 @@ def _parse_one_with_fallback(
     formula_enable: bool,
     table_enable: bool,
     gpu_id: int | None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, dict]:
     ok, err = subprocess_parse_one(
         pdf_path_str, output_dir_str, lang, backend,
         parse_method, formula_enable, table_enable, gpu_id,
     )
     if ok or not table_enable:
-        return ok, err
+        return ok, err, {}
 
     logger.warning(
         "解析失败（可能是表格模型崩溃），禁用表格后重试: %s",
         Path(pdf_path_str).name,
     )
-    return subprocess_parse_one(
+    ok2, err2 = subprocess_parse_one(
         pdf_path_str, output_dir_str, lang, backend,
         parse_method, formula_enable, table_enable=False, gpu_id=gpu_id,
     )
+    warnings = {"table_fallback_used": True}
+    return ok2, err2, warnings
 
 
 def subprocess_parse_one_smart(
@@ -190,7 +192,7 @@ def subprocess_parse_one_smart(
     table_enable: bool,
     gpu_id: int | None = None,
     page_limit: int = 60,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, dict]:
     import importlib
     _splitter = importlib.import_module("patent_parser.pdf_splitter")
     get_page_count = _splitter.get_page_count
@@ -237,7 +239,7 @@ def subprocess_parse_one_smart(
             logger.info(
                 "  解析分片 [%d/%d]: %s", j, len(part_paths), part_path.name
             )
-            ok, err = _parse_one_with_fallback(
+            ok, err, warn = _parse_one_with_fallback(
                 str(part_path), output_dir_str, lang, backend,
                 parse_method, formula_enable, table_enable, gpu_id,
             )
@@ -246,23 +248,25 @@ def subprocess_parse_one_smart(
                 failed_parts.append(part_path.name)
                 if not first_error:
                     first_error = f"分片 {part_path.name} 失败: {err}"
+            if warn:
+                warnings.setdefault("table_fallback_used", True)
 
         if failed_parts:
             logger.error("  存在失败分片，跳过正式合并: %s", ", ".join(failed_parts))
             merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
             merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
             merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
-            return False, first_error or f"{len(failed_parts)} 个分片解析失败"
+            return False, first_error or f"{len(failed_parts)} 个分片解析失败", warnings
 
         merged = merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
-        merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
-        merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
-        if merged is not None and merged.exists():
+        merged_content = merge_content_list_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+        merged_middle = merge_middle_json_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+        if merged is not None and merged.exists() and merged_content is not None and merged_middle is not None:
             logger.info("  合并完成 (%d/%d 片): %s",
                         len(part_paths) - len(failed_parts), len(part_paths), merged)
-            return True, ""
+            return True, "", warnings
 
-        logger.error("  合并失败，无完整 md 可用: %s", pdf_path.name)
-        return False, "分片合并失败或缺失主 md"
+        logger.error("  合并失败或不完整: %s", pdf_path.name)
+        return False, "分片合并失败或缺失 md/content_list/middle", warnings
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

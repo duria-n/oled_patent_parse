@@ -86,7 +86,7 @@ class MinerUPatentParser(BasePDFParser):
             failed_file.write_text("\n".join(deduped_failed) + "\n", encoding="utf-8")
             logger.info("失败文件列表已写入: %s (%d 个)", failed_file, len(deduped_failed))
 
-    def _resolve_lang(self, pdf_path: Path) -> tuple[str, bool]:
+    def _resolve_lang(self, pdf_path: Path) -> tuple[str, bool, str]:
         """返回 (语言代码, 是否为扫描件)。"""
         return detect_pdf_language(pdf_path, allowed_langs=self.langs, wipo_provider=self.wipo_provider)
 
@@ -105,7 +105,7 @@ class MinerUPatentParser(BasePDFParser):
         return output_dir
 
     def _parse_one(self, pdf_path: Path, lang: str, output_dir: Path,
-                   is_scanned: bool = False, gpu_id: int | None = 0) -> tuple[bool, str]:
+                   is_scanned: bool = False, gpu_id: int | None = 0) -> tuple[bool, str, dict]:
         parse_method = "ocr" if is_scanned else self.parse_method
         return subprocess_parse_one_smart(
             pdf_path_str=str(pdf_path),
@@ -122,7 +122,7 @@ class MinerUPatentParser(BasePDFParser):
         done = DoneRecord(output_dir)
         total = len(pdf_files)
 
-        pending: list[tuple[int, Path, str, bool]] = []
+        pending: list[tuple[int, Path, str, bool, str]] = []
         skipped = 0
         for i, pdf_path in enumerate(pdf_files, 1):
             if done.is_done(pdf_path.name):
@@ -131,8 +131,8 @@ class MinerUPatentParser(BasePDFParser):
                 continue
             if done.is_failed(pdf_path.name):
                 logger.info("[%d/%d] 重试（上次失败）: %s", i, total, pdf_path.name)
-            lang, is_scanned = self._resolve_lang(pdf_path)
-            pending.append((i, pdf_path, lang, is_scanned))
+            lang, is_scanned, lang_source = self._resolve_lang(pdf_path)
+            pending.append((i, pdf_path, lang, is_scanned, lang_source))
 
         if not pending:
             logger.info("所有 %d 个 PDF 均已解析，无需处理", total)
@@ -153,20 +153,46 @@ class MinerUPatentParser(BasePDFParser):
 
     def _parse_sequential(self, pending, output_dir, done):
         pending_total = len(pending)
-        for i, (idx, pdf_path, lang, is_scanned) in enumerate(pending, 1):
+        for i, (idx, pdf_path, lang, is_scanned, lang_source) in enumerate(pending, 1):
             gpu_id = self.gpu_ids[0]
             method_info = "OCR（扫描件）" if is_scanned else self.parse_method
             logger.info("[%d/%d] 正在解析: %s (语言: %s, 方法: %s, GPU: %d)",
                         i, pending_total, pdf_path.name, lang, method_info, gpu_id)
             t0 = time.time()
-            success, err = self._parse_one(pdf_path, lang, output_dir, is_scanned, gpu_id)
+            success, err, warnings = self._parse_one(pdf_path, lang, output_dir, is_scanned, gpu_id)
             elapsed = time.time() - t0
             if success:
-                done.mark(pdf_path.name, lang, "done")
-                logger.info("[%d/%d] 解析完成: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
-                self._postprocess_if_needed(pdf_path, output_dir, "ocr" if is_scanned else self.parse_method)
+                post_ok = self._postprocess_if_needed(
+                    pdf_path, output_dir, "ocr" if is_scanned else self.parse_method
+                )
+                if post_ok:
+                    done.mark(
+                        pdf_path.name, lang, "done",
+                        lang_source=lang_source,
+                        table_fallback_used=bool(warnings.get("table_fallback_used")),
+                        done_with_warnings=bool(warnings),
+                        warnings=warnings or None,
+                    )
+                    logger.info("[%d/%d] 解析完成: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
+                else:
+                    done.mark(
+                        pdf_path.name, lang, "failed",
+                        error_msg="后处理失败或结构化输出缺失",
+                        lang_source=lang_source,
+                        table_fallback_used=bool(warnings.get("table_fallback_used")),
+                        done_with_warnings=bool(warnings),
+                        warnings=warnings or None,
+                    )
+                    logger.error("[%d/%d] 后处理失败: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
             else:
-                done.mark(pdf_path.name, lang, "failed", error_msg=err or "非零退出码")
+                done.mark(
+                    pdf_path.name, lang, "failed",
+                    error_msg=err or "非零退出码",
+                    lang_source=lang_source,
+                    table_fallback_used=bool(warnings.get("table_fallback_used")),
+                    done_with_warnings=bool(warnings),
+                    warnings=warnings or None,
+                )
                 logger.error("[%d/%d] 解析失败（segfault/超时）: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
 
     def _parse_parallel(self, pending, output_dir, done):
@@ -187,7 +213,7 @@ class MinerUPatentParser(BasePDFParser):
         future_map = {}
         _interrupted = False
         try:
-            for i, (idx, pdf_path, lang, is_scanned) in enumerate(pending):
+            for i, (idx, pdf_path, lang, is_scanned, lang_source) in enumerate(pending):
                 parse_method = "ocr" if is_scanned else self.parse_method
                 future = executor.submit(
                     subprocess_parse_one_smart,
@@ -200,29 +226,56 @@ class MinerUPatentParser(BasePDFParser):
                     table_enable=self.table_enable,
                     gpu_id=None,  # 让 subprocess_worker 去读取进程注入的环境变量
                 )
-                future_map[future] = (pdf_path, lang, is_scanned, time.time())
+                future_map[future] = (pdf_path, lang, is_scanned, lang_source, time.time())
 
             completed = 0
             for future in as_completed(future_map):
                 completed += 1
-                pdf_path, lang, is_scanned, t0 = future_map[future]
+                pdf_path, lang, is_scanned, lang_source, t0 = future_map[future]
                 elapsed = time.time() - t0
                 try:
-                    success, err = future.result()
+                    success, err, warnings = future.result()
                     if success:
-                        done.mark(pdf_path.name, lang, "done")
-                        logger.info("[%d/%d] 解析完成: %s (耗时 %.2fs)", completed, pending_total, pdf_path.name, elapsed)
-                        self._postprocess_if_needed(
+                        post_ok = self._postprocess_if_needed(
                             pdf_path, output_dir, "ocr" if is_scanned else self.parse_method
                         )
+                        if post_ok:
+                            done.mark(
+                                pdf_path.name, lang, "done",
+                                lang_source=lang_source,
+                                table_fallback_used=bool(warnings.get("table_fallback_used")),
+                                done_with_warnings=bool(warnings),
+                                warnings=warnings or None,
+                            )
+                            logger.info("[%d/%d] 解析完成: %s (耗时 %.2fs)", completed, pending_total, pdf_path.name, elapsed)
+                        else:
+                            done.mark(
+                                pdf_path.name, lang, "failed",
+                                error_msg="后处理失败或结构化输出缺失",
+                                lang_source=lang_source,
+                                table_fallback_used=bool(warnings.get("table_fallback_used")),
+                                done_with_warnings=bool(warnings),
+                                warnings=warnings or None,
+                            )
+                            logger.error("[%d/%d] 后处理失败: %s (耗时 %.2fs)", completed, pending_total, pdf_path.name, elapsed)
                     else:
-                        done.mark(pdf_path.name, lang, "failed", error_msg=err or "非零退出码")
+                        done.mark(
+                            pdf_path.name, lang, "failed",
+                            error_msg=err or "非零退出码",
+                            lang_source=lang_source,
+                            table_fallback_used=bool(warnings.get("table_fallback_used")),
+                            done_with_warnings=bool(warnings),
+                            warnings=warnings or None,
+                        )
                         logger.error("[%d/%d] 解析失败: %s (耗时 %.2fs)", completed, pending_total, pdf_path.name, elapsed)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
-                    done.mark(pdf_path.name, lang, "failed",
-                              error_msg=str(exc) or type(exc).__name__)
+                    done.mark(
+                        pdf_path.name, lang, "failed",
+                        error_msg=str(exc) or type(exc).__name__,
+                        lang_source=lang_source,
+                    )
                     logger.exception("[%d/%d] worker 异常: %s (耗时 %.2fs)", completed, pending_total, pdf_path.name, elapsed)
 
         except KeyboardInterrupt:
@@ -272,16 +325,18 @@ class MinerUPatentParser(BasePDFParser):
 
         logger.info("共收集 %d 个新 md 项目（含图片）到 %s", collected, md_target)
 
-    def _postprocess_if_needed(self, pdf_path: Path, output_dir: Path, parse_method: str) -> None:
+    def _postprocess_if_needed(self, pdf_path: Path, output_dir: Path, parse_method: str) -> bool:
         if not self.postprocess_enable:
-            return
+            return True
         try:
-            build_structured_json(
+            result = build_structured_json(
                 pdf_path,
                 output_dir,
                 parse_method=parse_method,
                 biblio_provider=self.biblio_provider,
                 keep_raw=self.keep_raw,
             )
+            return result is not None
         except Exception as exc:
             logger.warning("后处理失败: %s (%s)", pdf_path.name, exc)
+            return False
