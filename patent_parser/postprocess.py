@@ -747,7 +747,7 @@ def build_structured_json(
 
     paragraph_index = 0
     doc_char_offset = 0
-    context = {"section": None}
+    context = {"section": None, "subsection": None, "example_id": None}
     reference_numerals: dict[str, str] = {}
 
     for idx, item in enumerate(content_list):
@@ -780,7 +780,21 @@ def build_structured_json(
             relations.extend(_bind_material_roles(text, entities, base_id=block_id))
             for ri, rel in enumerate(relations, 1):
                 rel["relation_id"] = f"{block_id}_r{ri:03d}"
-            example_id = _extract_example_id(text) if sem_type in _EXAMPLE_KEYWORDS or sem_type.endswith("_example") else None
+            is_example_sec = sem_type in _EXAMPLE_KEYWORDS or sem_type.endswith("_example")
+            raw_ex_id = _extract_example_id(text) if is_example_sec else None
+            if raw_ex_id:
+                context["example_id"] = f"{sem_type}_{raw_ex_id}"
+            else:
+                # 进入非实施例章节时清空上下文
+                if context.get("section") in {"claims", "abstract"}:
+                    context["example_id"] = None
+                elif sem_type in {"claims_title", "claim"}:
+                    context["example_id"] = None
+                elif sem_type == "title" and context.get("subsection") in {
+                    "background", "summary", "drawings_desc", "detailed_desc"
+                }:
+                    context["example_id"] = None
+            example_id = context.get("example_id")
             if sem_type.startswith("claim"):
                 depends_on = _extract_claim_depends(text)
             else:
@@ -844,6 +858,10 @@ def build_structured_json(
                 ent["entity_id"] = f"{table_id}_e{ei:03d}"
                 if ent.get("type") == "material" and not ent.get("canonical_id"):
                     ent["canonical_id"] = "PENDING_MAPPING"
+            table_relations = _bind_metric_values(cell_text, table_entities, base_id=table_id)
+            table_relations.extend(_bind_material_roles(cell_text, table_entities, base_id=table_id))
+            for ri, rel in enumerate(table_relations, 1):
+                rel["relation_id"] = f"{table_id}_r{ri:03d}"
             table_units = _extract_table_units(table_struct.get("rows", []))
 
             tables.append({
@@ -861,6 +879,11 @@ def build_structured_json(
                 "block_id": block_id,
                 "type": "table",
                 "table_id": table_id,
+                "entities": table_entities,
+                "relations": table_relations,
+                "section": context.get("section"),
+                "subsection": context.get("subsection"),
+                "example_id": context.get("example_id"),
                 "provenance": base_prov | {"paragraph_index": paragraph_index},
             })
             paragraph_index += 1
@@ -888,6 +911,7 @@ def build_structured_json(
                     "relations": cap_relations,
                     "section": context.get("section"),
                     "subsection": context.get("subsection"),
+                    "example_id": context.get("example_id"),
                 })
                 paragraph_index += 1
             continue
@@ -914,6 +938,9 @@ def build_structured_json(
                 "block_id": block_id,
                 "type": "figure",
                 "figure_id": fig_id,
+                "section": context.get("section"),
+                "subsection": context.get("subsection"),
+                "example_id": context.get("example_id"),
                 "provenance": base_prov | {"paragraph_index": paragraph_index},
             })
             paragraph_index += 1
@@ -941,6 +968,7 @@ def build_structured_json(
                     "relations": cap_relations,
                     "section": context.get("section"),
                     "subsection": context.get("subsection"),
+                    "example_id": context.get("example_id"),
                 })
                 paragraph_index += 1
             continue
@@ -951,6 +979,9 @@ def build_structured_json(
             "type": btype or "unknown",
             "raw": item,
             "provenance": base_prov | {"paragraph_index": paragraph_index},
+            "section": context.get("section"),
+            "subsection": context.get("subsection"),
+            "example_id": context.get("example_id"),
         })
         paragraph_index += 1
 
