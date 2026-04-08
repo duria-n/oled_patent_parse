@@ -11,6 +11,7 @@ from .base_parser import BasePDFParser
 from .config import logger
 from .done_record import DoneRecord
 from .lang_detect import detect_pdf_language
+from .biblio_cache import BiblioMetadataProvider
 from .postprocess import build_structured_json
 from .wipo_metadata import WIPOMetadataProvider
 from .subprocess_worker import subprocess_parse_one_smart
@@ -48,6 +49,7 @@ class MinerUPatentParser(BasePDFParser):
         gpu_ids: list[int] | None = None,
         wipo_metadata_path: str | None = None,
         postprocess_enable: bool = True,
+        biblio_metadata_path: str | None = None,
     ):
         super().__init__(input_root, output_root)
         self.langs = langs if langs else ["ch", "chinese_cht", "japan", "en", "korean"]
@@ -57,6 +59,7 @@ class MinerUPatentParser(BasePDFParser):
         self.table_enable = table_enable
         self.postprocess_enable = postprocess_enable
         self.wipo_provider = WIPOMetadataProvider(wipo_metadata_path)
+        self.biblio_provider = BiblioMetadataProvider(biblio_metadata_path)
 
         total_gpus = _get_gpu_count()
         if gpu_ids is not None:
@@ -273,6 +276,11 @@ class MinerUPatentParser(BasePDFParser):
         if not self.postprocess_enable:
             return
         try:
-            build_structured_json(pdf_path, output_dir, parse_method=parse_method)
+            build_structured_json(
+                pdf_path,
+                output_dir,
+                parse_method=parse_method,
+                biblio_provider=self.biblio_provider,
+            )
         except Exception as exc:
             logger.warning("后处理失败: %s (%s)", pdf_path.name, exc)

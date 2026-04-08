@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 
+from .biblio_cache import BiblioMetadataProvider
 from .config import logger
 
 
@@ -20,13 +21,23 @@ class PageInfo:
 _FIG_RE = re.compile(r"\b(?:fig(?:ure)?|图)\s*\.?\s*(\d+[a-zA-Z]?)", re.I)
 _TABLE_RE = re.compile(r"\b(?:table|表)\s*\.?\s*(\d+[a-zA-Z]?)", re.I)
 _CLAIM_RE = re.compile(r"^\s*(\d+)\s*[\.\、:)]\s*(.+)$")
-_CLAIM_DEP_RE = re.compile(r"(?:claim|权利要求)\s*(\d+)", re.I)
+_CLAIM_DEP_RE = re.compile(
+    r"(?:claim|claims|权利要求)\s*"
+    r"(\d+(?:\s*(?:to|至|-|and|or|、|和)\s*\d+)*)",
+    re.I,
+)
+_REF_NUM_RE = re.compile(r"([A-Za-z\u4e00-\u9fa5][A-Za-z\u4e00-\u9fa5\\s\\-]*)\s*\\((\\d+)\\)")
+_INID_RE = re.compile(r"^[\[\(](\d{2})[\]\)]\s*(.*)$")
 
 
 _SECTION_KEYWORDS = {
     "abstract": [r"\babstract\b", r"摘要"],
     "claims": [r"\bclaims?\b", r"权利要求书", r"权利要求"],
     "description": [r"\bdescription\b", r"说明书"],
+    "background": [r"\bbackground\b", r"背景技术"],
+    "summary": [r"\bsummary\b", r"发明内容"],
+    "drawings_desc": [r"\bbrief description of the drawings\b", r"附图说明"],
+    "detailed_desc": [r"\bdetailed description\b", r"具体实施方式"],
 }
 
 _EXAMPLE_KEYWORDS = {
@@ -41,6 +52,26 @@ _METRIC_KEYWORDS = [
     "eqe", "ce", "pe", "current efficiency", "power efficiency", "luminance",
     "t50", "lt50", "lifetime", "turn-on voltage", "voltage", "cie",
 ]
+_METRIC_UNIT_HINTS = {
+    "eqe": {"%"},
+    "ce": {"cd/a", "cd/a."},
+    "current efficiency": {"cd/a"},
+    "power efficiency": {"lm/w"},
+    "pe": {"lm/w"},
+    "luminance": {"cd/m2", "cd*m-2", "cd m-2"},
+    "t50": {"h", "hr", "hours"},
+    "lt50": {"h", "hr", "hours"},
+    "lifetime": {"h", "hr", "hours"},
+    "turn-on voltage": {"v"},
+    "voltage": {"v"},
+    "cie": set(),  # 通常是坐标对，无单位
+}
+_CIE_RE = re.compile(
+    r"cie(?:\s*1931)?\s*"
+    r"(?:[\(\[]\s*([0-9.]+)\s*[,，]\s*([0-9.]+)\s*[\)\]]"
+    r"|\s+([0-9.]+)\s*[,，]\s*([0-9.]+))",
+    re.I,
+)
 
 _LAYER_SYNONYMS = {
     "htl": "hole_transport_layer",
@@ -133,6 +164,13 @@ class _SimpleHTMLTableParser(HTMLParser):
 def _parse_table_html(html: str) -> dict:
     parser = _SimpleHTMLTableParser()
     parser.feed(html)
+    for row in parser.rows:
+        for cell in row:
+            if not isinstance(cell, dict):
+                continue
+            cell_entities = _extract_entities(cell.get("text", ""))
+            if cell_entities:
+                cell["entities"] = cell_entities
     return {"rows": parser.rows}
 
 
@@ -179,7 +217,12 @@ def _classify_text_block(text: str, context: dict) -> str:
         return "text"
     for section, pats in _SECTION_KEYWORDS.items():
         if _match_any(t, pats):
+            if section in {"background", "summary", "drawings_desc", "detailed_desc"}:
+                context["section"] = "description"
+                context["subsection"] = section
+                return "title"
             context["section"] = section
+            context["subsection"] = None
             return "title" if section != "claims" else "claims_title"
     for key, pats in _EXAMPLE_KEYWORDS.items():
         if _match_any(t, pats):
@@ -210,6 +253,7 @@ def _extract_entities(text: str) -> list[dict]:
     for m in _UNIT_RE.finditer(text):
         raw_val = m.group("value")
         unit = m.group("unit")
+        span = [m.start(), m.end()]
         try:
             val = float(raw_val.replace("×", "x").replace("^", "").replace(" ", ""))
         except ValueError:
@@ -219,31 +263,236 @@ def _extract_entities(text: str) -> list[dict]:
             "value": raw_val,
             "unit": unit,
             "value_num": val,
+            "span": span,
         })
 
     lower = text.lower()
+    for m in _CIE_RE.finditer(text):
+        x = m.group(1) or m.group(3)
+        y = m.group(2) or m.group(4)
+        entities.append({
+            "type": "metric",
+            "value": "cie",
+            "span": [m.start(), m.end()],
+            "value_pair": [float(x), float(y)],
+        })
     for metric in _METRIC_KEYWORDS:
-        if metric in lower:
-            entities.append({"type": "metric", "value": metric})
+        for m in re.finditer(re.escape(metric), lower):
+            entities.append({
+                "type": "metric",
+                "value": metric,
+                "span": [m.start(), m.end()],
+            })
 
-    for token in _MATERIAL_RE.findall(text):
+    for m in _MATERIAL_RE.finditer(text):
+        token = m.group(0)
         if token.upper() in _MATERIAL_STOP:
             continue
         entities.append({
             "type": "material",
             "value": token,
             "normalized": token.lower(),
+            "span": [m.start(), m.end()],
         })
 
     for key, canonical in _LAYER_SYNONYMS.items():
-        if re.search(rf"\b{re.escape(key)}\b", lower):
-            entities.append({"type": "device_layer", "value": key, "normalized": canonical})
+        for m in re.finditer(rf"\b{re.escape(key)}\b", lower):
+            entities.append({
+                "type": "device_layer",
+                "value": key,
+                "normalized": canonical,
+                "span": [m.start(), m.end()],
+            })
 
     for role in _ROLE_KEYWORDS:
-        if role in lower:
-            entities.append({"type": "role", "value": role})
+        for m in re.finditer(re.escape(role), lower):
+            entities.append({
+                "type": "role",
+                "value": role,
+                "span": [m.start(), m.end()],
+            })
 
     return entities
+
+
+def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None = None) -> list[dict]:
+    metrics = [e for e in entities if e.get("type") == "metric" and e.get("span")]
+    values = [e for e in entities if e.get("type") == "value" and e.get("span")]
+    relations: list[dict] = []
+    if not metrics or not values:
+        # 特殊处理：CIE 坐标对直接作为关系输出
+        for met in metrics:
+            if met.get("value") == "cie" and met.get("value_pair"):
+                relations.append({
+                    "metric": "cie",
+                    "value": met.get("value_pair"),
+                    "unit": None,
+                    "metric_span": met.get("span"),
+                    "value_span": met.get("span"),
+                    "confidence": 0.95,
+                    "rule": "cie_coord_inline",
+                })
+        return relations
+
+    sentence_bounds = []
+    last = 0
+    for m in re.finditer(r"[.;。；]\s*", text):
+        sentence_bounds.append((last, m.end()))
+        last = m.end()
+    sentence_bounds.append((last, len(text)))
+
+    def _in_sent(span, sent):
+        return span[0] >= sent[0] and span[1] <= sent[1]
+
+    for sid, sent in enumerate(sentence_bounds):
+        sent_metrics = [m for m in metrics if _in_sent(m["span"], sent)]
+        sent_values = [v for v in values if _in_sent(v["span"], sent)]
+        if not sent_metrics or not sent_values:
+            # 允许 CIE 坐标对直接落 relation
+            for met in sent_metrics:
+                if met.get("value") == "cie" and met.get("value_pair"):
+                    relations.append({
+                        "metric": "cie",
+                        "value": met.get("value_pair"),
+                        "unit": None,
+                        "metric_span": met.get("span"),
+                        "value_span": met.get("span"),
+                        "confidence": 0.95,
+                        "rule": "cie_coord_inline",
+                        "distance": 0,
+                        "sentence_id": sentence_id if sentence_id is not None else sid,
+                    })
+            continue
+        for val in sent_values:
+            vpos = val["span"][0]
+            # 优先找最近的前置 metric
+            candidates = [m for m in sent_metrics if m["span"][0] <= vpos]
+            if not candidates:
+                candidates = sent_metrics
+            best = None
+            best_dist = None
+            for met in candidates:
+                mpos = met["span"][0]
+                dist = abs(vpos - mpos)
+                if best_dist is None or dist < best_dist:
+                    best = met
+                    best_dist = dist
+            if best is None:
+                continue
+            # 避免跨越另一个 metric
+            between = [
+                m for m in sent_metrics
+                if min(best["span"][0], vpos) < m["span"][0] < max(best["span"][0], vpos)
+            ]
+            if between:
+                continue
+            unit = val.get("unit")
+            rule = "nearest_metric"
+            confidence = 0.65
+            if unit:
+                unit_norm = unit.lower().replace(" ", "")
+                allowed = _METRIC_UNIT_HINTS.get(best["value"], set())
+                if allowed and unit_norm not in {u.replace(" ", "") for u in allowed}:
+                    continue
+                if allowed:
+                    rule = "metric_unit_match"
+                    confidence = 0.85
+            if best.get("value") == "cie" and best.get("value_pair"):
+                relations.append({
+                    "metric": "cie",
+                    "value": best.get("value_pair"),
+                    "unit": None,
+                    "metric_span": best.get("span"),
+                    "value_span": best.get("span"),
+                    "confidence": 0.95,
+                    "rule": "cie_coord_inline",
+                    "distance": 0,
+                    "sentence_id": sentence_id if sentence_id is not None else sid,
+                })
+                continue
+            distance = abs(vpos - best["span"][0])
+            relations.append({
+                "metric": best["value"],
+                "value": val.get("value_num") if val.get("value_num") is not None else val.get("value"),
+                "unit": val.get("unit"),
+                "metric_span": best.get("span"),
+                "value_span": val.get("span"),
+                "confidence": confidence,
+                "rule": rule,
+                "distance": distance,
+                "sentence_id": sentence_id if sentence_id is not None else sid,
+            })
+    return relations
+
+
+def _extract_example_id(text: str) -> str | None:
+    m = re.search(r"(?:实施例|例|example)\s*([\\dA-Za-z]+)", text, re.I)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _extract_claim_depends(text: str) -> list[int]:
+    m = _CLAIM_DEP_RE.search(text)
+    if not m:
+        return []
+    raw = m.group(1)
+    nums = []
+    parts = re.split(r"(?:to|至|-|and|or|、|和)", raw, flags=re.I)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        return []
+    # 支持范围（如 1-3）
+    range_m = re.match(r"(\\d+)\\s*(?:to|至|-)\\s*(\\d+)", raw, re.I)
+    if range_m:
+        start = int(range_m.group(1))
+        end = int(range_m.group(2))
+        if start <= end:
+            return list(range(start, end + 1))
+    for p in parts:
+        try:
+            nums.append(int(p))
+        except ValueError:
+            continue
+    return sorted(set(nums))
+
+
+def _build_claim_tree(blocks: list[dict]) -> dict:
+    nodes: dict[int, dict] = {}
+    for blk in blocks:
+        if not isinstance(blk, dict):
+            continue
+        claim_no = blk.get("claim_no")
+        if not claim_no:
+            continue
+        nodes[claim_no] = {
+            "claim_no": claim_no,
+            "text": blk.get("text"),
+            "depends_on": blk.get("depends_on") or [],
+            "children": [],
+        }
+    for node in nodes.values():
+        for parent in node["depends_on"]:
+            parent_node = nodes.get(parent)
+            if parent_node:
+                parent_node["children"].append(node["claim_no"])
+    roots = [n for n in nodes.values() if not n["depends_on"] or all(p not in nodes for p in n["depends_on"])]
+
+    def build_nested(claim_no: int) -> dict:
+        node = nodes[claim_no]
+        return {
+            "claim_no": node["claim_no"],
+            "text": node.get("text"),
+            "depends_on": node.get("depends_on") or [],
+            "children": [build_nested(c) for c in sorted(node.get("children", []))],
+        }
+
+    nested = [build_nested(r["claim_no"]) for r in sorted(roots, key=lambda x: x["claim_no"])]
+    return {
+        "roots": sorted([r["claim_no"] for r in roots]),
+        "nodes": nodes,
+        "nested": nested,
+    }
 
 
 def _load_page_info(middle_json_path: Path) -> dict[int, PageInfo]:
@@ -276,10 +525,63 @@ def _find_output_files(doc_dir: Path, stem: str) -> tuple[Path | None, Path | No
     return content, middle
 
 
+def _extract_inid_metadata(blocks: list[dict]) -> dict:
+    # 仅看首页文本块
+    lines: list[str] = []
+    for blk in blocks:
+        if blk.get("type") != "text":
+            continue
+        prov = blk.get("provenance", {})
+        if prov.get("page_no") != 1:
+            continue
+        text = blk.get("text", "")
+        if text:
+            lines.extend([ln.strip() for ln in text.splitlines() if ln.strip()])
+
+    if not lines:
+        return {}
+
+    fields: dict[str, list[str]] = {}
+    current = None
+    for ln in lines:
+        m = _INID_RE.match(ln)
+        if m:
+            current = m.group(1)
+            content = m.group(2).strip()
+            fields[current] = [content] if content else []
+            continue
+        if current:
+            fields[current].append(ln)
+
+    def _join(code: str) -> str | None:
+        vals = fields.get(code)
+        if not vals:
+            return None
+        return " ".join(v for v in vals if v).strip() or None
+
+    def _split_list(code: str) -> list[str] | None:
+        text = _join(code)
+        if not text:
+            return None
+        parts = [p.strip() for p in re.split(r";|/|,", text) if p.strip()]
+        return parts or None
+
+    return {
+        "publication_number": _join("10") or _join("11"),
+        "application_number": _join("21"),
+        "application_date": _join("22"),
+        "priority": _split_list("30"),
+        "title": _join("54"),
+        "applicants": _split_list("71") or _split_list("73"),
+        "inventors": _split_list("72"),
+    }
+
+
 def build_structured_json(
     pdf_path: Path,
     output_dir: Path,
     parse_method: str | None = None,
+    biblio_provider: BiblioMetadataProvider | None = None,
 ) -> Path | None:
     stem = pdf_path.stem
     doc_root = output_dir / stem
@@ -310,6 +612,7 @@ def build_structured_json(
     paragraph_index = 0
     doc_char_offset = 0
     context = {"section": None}
+    reference_numerals: dict[str, str] = {}
 
     for idx, item in enumerate(content_list):
         btype = item.get("type")
@@ -332,13 +635,40 @@ def build_structured_json(
             char_start = doc_char_offset
             char_end = char_start + len(text)
             doc_char_offset = char_end + 1
+            entities = _extract_entities(text)
+            relations = _bind_metric_values(text, entities, sentence_id=paragraph_index)
+            example_id = _extract_example_id(text) if sem_type in _EXAMPLE_KEYWORDS or sem_type.endswith("_example") else None
+            if sem_type.startswith("claim"):
+                depends_on = _extract_claim_depends(text)
+            else:
+                depends_on = []
+            claim_no = None
+            if sem_type.startswith("claim"):
+                cm = _CLAIM_RE.match(text)
+                if cm:
+                    try:
+                        claim_no = int(cm.group(1))
+                    except ValueError:
+                        claim_no = None
+
+            if sem_type == "description" or context.get("subsection") in {"background", "summary", "drawings_desc", "detailed_desc"}:
+                for m in _REF_NUM_RE.finditer(text):
+                    label = m.group(1).strip().lower()
+                    num = m.group(2)
+                    reference_numerals.setdefault(num, label)
 
             blocks.append({
                 "type": sem_type,
                 "text": text,
                 "char_offset": [char_start, char_end],
                 "provenance": base_prov | {"paragraph_index": paragraph_index},
-                "entities": _extract_entities(text),
+                "entities": entities,
+                "relations": relations,
+                "section": context.get("section"),
+                "subsection": context.get("subsection"),
+                "example_id": example_id,
+                "depends_on": depends_on if depends_on else None,
+                "claim_no": claim_no,
             })
             paragraph_index += 1
             continue
@@ -380,13 +710,18 @@ def build_structured_json(
                 m = _TABLE_RE.search(cap)
                 if m:
                     table_no = m.group(1)
+                cap_entities = _extract_entities(cap)
+                cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
                 cap_block_id = f"{table_id}_cap_{len(blocks)}"
                 blocks.append({
                     "type": "table_caption",
                     "text": cap,
                     "table_no": table_no,
                     "provenance": base_prov | {"block_id": cap_block_id, "paragraph_index": paragraph_index},
-                    "entities": _extract_entities(cap),
+                    "entities": cap_entities,
+                    "relations": cap_relations,
+                    "section": context.get("section"),
+                    "subsection": context.get("subsection"),
                 })
                 paragraph_index += 1
             continue
@@ -421,13 +756,18 @@ def build_structured_json(
                 m = _FIG_RE.search(cap)
                 if m:
                     fig_no = m.group(1)
+                cap_entities = _extract_entities(cap)
+                cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
                 cap_block_id = f"{fig_id}_cap_{len(blocks)}"
                 blocks.append({
                     "type": "figure_caption",
                     "text": cap,
                     "figure_no": fig_no,
                     "provenance": base_prov | {"block_id": cap_block_id, "paragraph_index": paragraph_index},
-                    "entities": _extract_entities(cap),
+                    "entities": cap_entities,
+                    "relations": cap_relations,
+                    "section": context.get("section"),
+                    "subsection": context.get("subsection"),
                 })
                 paragraph_index += 1
             continue
@@ -442,11 +782,44 @@ def build_structured_json(
 
     output = {
         "doc_id": stem,
+        "metadata": {},
+        "abstract": None,
         "source_file": str(pdf_path),
         "blocks": blocks,
         "figures": figures,
         "tables": tables,
+        "reference_numerals": reference_numerals or None,
     }
+    output["claim_tree"] = _build_claim_tree(blocks)
+
+    # 抽取 abstract（如果已分类）
+    abstracts = [b.get("text") for b in blocks if b.get("type") == "abstract" and b.get("text")]
+    if abstracts:
+        output["abstract"] = "\n".join(abstracts)
+
+    # 注入本地缓存题录元数据
+    if biblio_provider:
+        cached = biblio_provider.lookup(stem)
+        if cached:
+            output["metadata"] = {
+                "publication_number": cached.publication_number,
+                "publication_date": cached.publication_date,
+                "application_number": cached.application_number,
+                "application_date": cached.application_date,
+                "priority": cached.priority,
+                "title": cached.title,
+                "applicants": cached.applicants,
+                "inventors": cached.inventors,
+                "ipc": cached.ipc,
+                "cpc": cached.cpc,
+                "source": cached.source or "cache",
+            }
+
+    # 回退：INID 扉页解析（仅在未命中缓存时）
+    if not output["metadata"]:
+        inid = _extract_inid_metadata(blocks)
+        if inid:
+            output["metadata"] = inid | {"source": "inid"}
 
     out_path = doc_dir / f"{stem}_structured.json"
     out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")

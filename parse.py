@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--no-table", action="store_true", help="禁用表格解析")
     ap.add_argument("--wipo-metadata", default=None,
                     help="WO 官方语言元数据缓存 JSON 路径（优先使用 publication_language）")
+    ap.add_argument("--biblio-metadata", default=None,
+                    help="题录元数据缓存 JSON 路径（注入 metadata 字段）")
     ap.add_argument("--no-postprocess", action="store_true",
                     help="禁用结构化后处理 JSON 输出")
     args = ap.parse_args()
@@ -91,6 +93,7 @@ def main():
         gpu_ids=args.gpus,
         wipo_metadata_path=args.wipo_metadata,
         postprocess_enable=not args.no_postprocess,
+        biblio_metadata_path=args.biblio_metadata,
     )
 
     # 捕获 Ctrl+C：打印提示后正常退出，让底层清理逻辑（finally 块）有机会执行
