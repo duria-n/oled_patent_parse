@@ -35,7 +35,10 @@ class PageInfo:
 # ----------------------------
 if BaseModel:
     class EntityModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         entity_id: str
         type: str
         value: Optional[str] = None
@@ -47,7 +50,10 @@ if BaseModel:
         canonical_id: Optional[str] = None
 
     class RelationModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         relation_id: str
         type: str
         source_entity_id: str
@@ -55,10 +61,13 @@ if BaseModel:
         confidence: float
         rule: str
         distance: int
-        sentence_id: int
+        sentence_id: str
 
     class BlockModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         block_id: str
         type: str
         text: Optional[str] = None
@@ -73,7 +82,10 @@ if BaseModel:
         claim_no: Optional[int] = None
 
     class TableModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         table_id: str
         html: Optional[str] = None
         structure: dict[str, Any]
@@ -84,7 +96,10 @@ if BaseModel:
         provenance: dict[str, Any]
 
     class FigureModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         figure_id: str
         figure_no: Optional[str] = None
         caption: list[str] = Field(default_factory=list)
@@ -92,7 +107,10 @@ if BaseModel:
         provenance: dict[str, Any]
 
     class DocumentModel(BaseModel):
-        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        model_config = ConfigDict(extra="ignore") if ConfigDict else {}
+        if ConfigDict is None:
+            class Config:
+                extra = "ignore"
         doc_id: str
         metadata: dict[str, Any]
         abstract: Optional[str] = None
@@ -411,24 +429,12 @@ def _extract_entities(text: str) -> list[dict]:
 def _bind_metric_values(
     text: str,
     entities: list[dict],
-    sentence_id: int | None = None,
+    base_id: str,
 ) -> list[dict]:
     metrics = [e for e in entities if e.get("type") == "metric" and e.get("span")]
     values = [e for e in entities if e.get("type") == "value" and e.get("span")]
     relations: list[dict] = []
     if not metrics or not values:
-        # 特殊处理：CIE 坐标对直接作为关系输出
-        for met in metrics:
-            if met.get("value") == "cie" and met.get("value_pair"):
-                relations.append({
-                    "metric": "cie",
-                    "value": met.get("value_pair"),
-                    "unit": None,
-                    "metric_span": met.get("span"),
-                    "value_span": met.get("span"),
-                    "confidence": 0.95,
-                    "rule": "cie_coord_inline",
-                })
         return relations
 
     sentence_bounds = []
@@ -488,7 +494,7 @@ def _bind_metric_values(
             tgt_id = val.get("entity_id")
             if not src_id or not tgt_id:
                 continue
-            sent_id = (sentence_id * 1000 + sid) if sentence_id is not None else sid
+            sent_id = f"{base_id}_s{sid:03d}"
             relations.append({
                 "type": "has_value",
                 "source_entity_id": src_id,
@@ -497,6 +503,56 @@ def _bind_metric_values(
                 "rule": rule,
                 "distance": distance,
                 "sentence_id": sent_id,
+            })
+    return relations
+
+
+def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[dict]:
+    materials = [e for e in entities if e.get("type") == "material" and e.get("span")]
+    roles = [e for e in entities if e.get("type") == "role" and e.get("span")]
+    relations: list[dict] = []
+    if not materials or not roles:
+        return relations
+
+    sentence_bounds = []
+    last = 0
+    for m in re.finditer(r"[.;。；]\s*", text):
+        sentence_bounds.append((last, m.end()))
+        last = m.end()
+    sentence_bounds.append((last, len(text)))
+
+    def _in_sent(span, sent):
+        return span[0] >= sent[0] and span[1] <= sent[1]
+
+    for sid, sent in enumerate(sentence_bounds):
+        sent_mats = [m for m in materials if _in_sent(m["span"], sent)]
+        sent_roles = [r for r in roles if _in_sent(r["span"], sent)]
+        if not sent_mats or not sent_roles:
+            continue
+        for role in sent_roles:
+            rpos = role["span"][0]
+            best = None
+            best_dist = None
+            for mat in sent_mats:
+                mpos = mat["span"][0]
+                dist = abs(rpos - mpos)
+                if best_dist is None or dist < best_dist:
+                    best = mat
+                    best_dist = dist
+            if not best:
+                continue
+            src_id = best.get("entity_id")
+            tgt_id = role.get("entity_id")
+            if not src_id or not tgt_id:
+                continue
+            relations.append({
+                "type": "has_role",
+                "source_entity_id": src_id,
+                "target_entity_id": tgt_id,
+                "confidence": 0.7,
+                "rule": "nearest_role",
+                "distance": int(best_dist or 0),
+                "sentence_id": f"{base_id}_s{sid:03d}",
             })
     return relations
 
@@ -711,7 +767,8 @@ def build_structured_json(
                 ent["entity_id"] = f"{block_id}_e{ei:03d}"
                 if ent.get("type") == "material" and ent.get("canonical_id") is None:
                     ent["canonical_id"] = None
-            relations = _bind_metric_values(text, entities, sentence_id=paragraph_index)
+            relations = _bind_metric_values(text, entities, base_id=block_id)
+            relations.extend(_bind_material_roles(text, entities, base_id=block_id))
             for ri, rel in enumerate(relations, 1):
                 rel["relation_id"] = f"{block_id}_r{ri:03d}"
             example_id = _extract_example_id(text) if sem_type in _EXAMPLE_KEYWORDS or sem_type.endswith("_example") else None
@@ -799,18 +856,19 @@ def build_structured_json(
             })
             paragraph_index += 1
 
-            for cap in caption_list:
+            for cap_idx, cap in enumerate(caption_list, 1):
                 table_no = None
                 m = _TABLE_RE.search(cap)
                 if m:
                     table_no = m.group(1)
                 cap_entities = _extract_entities(cap)
+                cap_block_id = f"{table_id}_cap{cap_idx:02d}"
                 for ei, ent in enumerate(cap_entities, 1):
-                    ent["entity_id"] = f"{table_id}_cap_e{ei:03d}"
-                cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
+                    ent["entity_id"] = f"{cap_block_id}_e{ei:03d}"
+                cap_relations = _bind_metric_values(cap, cap_entities, base_id=cap_block_id)
+                cap_relations.extend(_bind_material_roles(cap, cap_entities, base_id=cap_block_id))
                 for ri, rel in enumerate(cap_relations, 1):
-                    rel["relation_id"] = f"{table_id}_cap_r{ri:03d}"
-                cap_block_id = f"{table_id}_cap_{len(blocks)}"
+                    rel["relation_id"] = f"{cap_block_id}_r{ri:03d}"
                 blocks.append({
                     "block_id": cap_block_id,
                     "type": "table_caption",
@@ -851,18 +909,19 @@ def build_structured_json(
             })
             paragraph_index += 1
 
-            for cap in caption_list:
+            for cap_idx, cap in enumerate(caption_list, 1):
                 fig_no = None
                 m = _FIG_RE.search(cap)
                 if m:
                     fig_no = m.group(1)
                 cap_entities = _extract_entities(cap)
+                cap_block_id = f"{fig_id}_cap{cap_idx:02d}"
                 for ei, ent in enumerate(cap_entities, 1):
-                    ent["entity_id"] = f"{fig_id}_cap_e{ei:03d}"
-                cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
+                    ent["entity_id"] = f"{cap_block_id}_e{ei:03d}"
+                cap_relations = _bind_metric_values(cap, cap_entities, base_id=cap_block_id)
+                cap_relations.extend(_bind_material_roles(cap, cap_entities, base_id=cap_block_id))
                 for ri, rel in enumerate(cap_relations, 1):
-                    rel["relation_id"] = f"{fig_id}_cap_r{ri:03d}"
-                cap_block_id = f"{fig_id}_cap_{len(blocks)}"
+                    rel["relation_id"] = f"{cap_block_id}_r{ri:03d}"
                 blocks.append({
                     "block_id": cap_block_id,
                     "type": "figure_caption",
