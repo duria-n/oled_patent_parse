@@ -5,17 +5,104 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from typing import Any, Optional
 from html.parser import HTMLParser
 from pathlib import Path
 
 from .biblio_cache import BiblioMetadataProvider
 from .config import logger
 
+try:
+    from pydantic import BaseModel, Field
+    try:
+        from pydantic import ConfigDict
+    except Exception:
+        ConfigDict = None  # type: ignore
+except Exception:  # pragma: no cover
+    BaseModel = None  # type: ignore
+    Field = None  # type: ignore
+    ConfigDict = None  # type: ignore
+
 
 @dataclass
 class PageInfo:
     width: int
     height: int
+
+
+# ----------------------------
+# Pydantic Data Contract
+# ----------------------------
+if BaseModel:
+    class EntityModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        entity_id: str
+        type: str
+        value: Optional[str] = None
+        value_num: Optional[float] = None
+        unit: Optional[str] = None
+        value_pair: Optional[list[float]] = None
+        span: Optional[list[int]] = None
+        normalized: Optional[str] = None
+        canonical_id: Optional[str] = None
+
+    class RelationModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        relation_id: str
+        type: str
+        source_entity_id: str
+        target_entity_id: str
+        confidence: float
+        rule: str
+        distance: int
+        sentence_id: int
+
+    class BlockModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        block_id: str
+        type: str
+        text: Optional[str] = None
+        char_offset: Optional[list[int]] = None
+        provenance: dict[str, Any]
+        entities: list[EntityModel] = Field(default_factory=list)
+        relations: list[RelationModel] = Field(default_factory=list)
+        section: Optional[str] = None
+        subsection: Optional[str] = None
+        example_id: Optional[str] = None
+        depends_on: Optional[list[int]] = None
+        claim_no: Optional[int] = None
+
+    class TableModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        table_id: str
+        html: Optional[str] = None
+        structure: dict[str, Any]
+        units: list[str] = Field(default_factory=list)
+        caption: list[str] = Field(default_factory=list)
+        image_path: Optional[str] = None
+        entities: list[EntityModel] = Field(default_factory=list)
+        provenance: dict[str, Any]
+
+    class FigureModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        figure_id: str
+        figure_no: Optional[str] = None
+        caption: list[str] = Field(default_factory=list)
+        image_path: Optional[str] = None
+        provenance: dict[str, Any]
+
+    class DocumentModel(BaseModel):
+        model_config = ConfigDict(extra="allow") if ConfigDict else {}
+        doc_id: str
+        metadata: dict[str, Any]
+        abstract: Optional[str] = None
+        source_file: str
+        blocks: list[BlockModel]
+        figures: list[FigureModel]
+        tables: list[TableModel]
+        reference_numerals: Optional[dict[str, str]] = None
+        claim_tree: dict[str, Any]
+        experiments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 _FIG_RE = re.compile(r"\b(?:fig(?:ure)?|图)\s*\.?\s*(\d+[a-zA-Z]?)", re.I)
@@ -276,6 +363,12 @@ def _extract_entities(text: str) -> list[dict]:
             "span": [m.start(), m.end()],
             "value_pair": [float(x), float(y)],
         })
+        entities.append({
+            "type": "value",
+            "value": f"{x},{y}",
+            "value_pair": [float(x), float(y)],
+            "span": [m.start(), m.end()],
+        })
     for metric in _METRIC_KEYWORDS:
         for m in re.finditer(re.escape(metric), lower):
             entities.append({
@@ -315,7 +408,11 @@ def _extract_entities(text: str) -> list[dict]:
     return entities
 
 
-def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None = None) -> list[dict]:
+def _bind_metric_values(
+    text: str,
+    entities: list[dict],
+    sentence_id: int | None = None,
+) -> list[dict]:
     metrics = [e for e in entities if e.get("type") == "metric" and e.get("span")]
     values = [e for e in entities if e.get("type") == "value" and e.get("span")]
     relations: list[dict] = []
@@ -348,20 +445,6 @@ def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None
         sent_metrics = [m for m in metrics if _in_sent(m["span"], sent)]
         sent_values = [v for v in values if _in_sent(v["span"], sent)]
         if not sent_metrics or not sent_values:
-            # 允许 CIE 坐标对直接落 relation
-            for met in sent_metrics:
-                if met.get("value") == "cie" and met.get("value_pair"):
-                    relations.append({
-                        "metric": "cie",
-                        "value": met.get("value_pair"),
-                        "unit": None,
-                        "metric_span": met.get("span"),
-                        "value_span": met.get("span"),
-                        "confidence": 0.95,
-                        "rule": "cie_coord_inline",
-                        "distance": 0,
-                        "sentence_id": sentence_id if sentence_id is not None else sid,
-                    })
             continue
         for val in sent_values:
             vpos = val["span"][0]
@@ -389,6 +472,9 @@ def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None
             unit = val.get("unit")
             rule = "nearest_metric"
             confidence = 0.65
+            if best.get("value") == "cie" and val.get("value_pair"):
+                rule = "cie_coord_inline"
+                confidence = 0.95
             if unit:
                 unit_norm = unit.lower().replace(" ", "")
                 allowed = _METRIC_UNIT_HINTS.get(best["value"], set())
@@ -397,30 +483,20 @@ def _bind_metric_values(text: str, entities: list[dict], sentence_id: int | None
                 if allowed:
                     rule = "metric_unit_match"
                     confidence = 0.85
-            if best.get("value") == "cie" and best.get("value_pair"):
-                relations.append({
-                    "metric": "cie",
-                    "value": best.get("value_pair"),
-                    "unit": None,
-                    "metric_span": best.get("span"),
-                    "value_span": best.get("span"),
-                    "confidence": 0.95,
-                    "rule": "cie_coord_inline",
-                    "distance": 0,
-                    "sentence_id": sentence_id if sentence_id is not None else sid,
-                })
-                continue
             distance = abs(vpos - best["span"][0])
+            src_id = best.get("entity_id")
+            tgt_id = val.get("entity_id")
+            if not src_id or not tgt_id:
+                continue
+            sent_id = (sentence_id * 1000 + sid) if sentence_id is not None else sid
             relations.append({
-                "metric": best["value"],
-                "value": val.get("value_num") if val.get("value_num") is not None else val.get("value"),
-                "unit": val.get("unit"),
-                "metric_span": best.get("span"),
-                "value_span": val.get("span"),
+                "type": "has_value",
+                "source_entity_id": src_id,
+                "target_entity_id": tgt_id,
                 "confidence": confidence,
                 "rule": rule,
                 "distance": distance,
-                "sentence_id": sentence_id if sentence_id is not None else sid,
+                "sentence_id": sent_id,
             })
     return relations
 
@@ -631,7 +707,13 @@ def build_structured_json(
             char_end = char_start + len(text)
             doc_char_offset = char_end + 1
             entities = _extract_entities(text)
+            for ei, ent in enumerate(entities, 1):
+                ent["entity_id"] = f"{block_id}_e{ei:03d}"
+                if ent.get("type") == "material" and ent.get("canonical_id") is None:
+                    ent["canonical_id"] = None
             relations = _bind_metric_values(text, entities, sentence_id=paragraph_index)
+            for ri, rel in enumerate(relations, 1):
+                rel["relation_id"] = f"{block_id}_r{ri:03d}"
             example_id = _extract_example_id(text) if sem_type in _EXAMPLE_KEYWORDS or sem_type.endswith("_example") else None
             if sem_type.startswith("claim"):
                 depends_on = _extract_claim_depends(text)
@@ -653,6 +735,7 @@ def build_structured_json(
                     reference_numerals.setdefault(num, label)
 
             blocks.append({
+                "block_id": block_id,
                 "type": sem_type,
                 "text": text,
                 "char_offset": [char_start, char_end],
@@ -673,6 +756,17 @@ def build_structured_json(
             caption_list = item.get("table_caption", []) or []
             table_id = f"{block_id}_table"
             table_struct = _parse_table_html(html) if html else {"rows": []}
+            for r_idx, row in enumerate(table_struct.get("rows", []), 1):
+                for c_idx, cell in enumerate(row, 1):
+                    if not isinstance(cell, dict):
+                        continue
+                    ents = cell.get("entities") or []
+                    for ei, ent in enumerate(ents, 1):
+                        ent["entity_id"] = f"{table_id}_r{r_idx:03d}_c{c_idx:03d}_e{ei:03d}"
+                        if ent.get("type") == "material" and ent.get("canonical_id") is None:
+                            ent["canonical_id"] = None
+                    if ents:
+                        cell["entities"] = ents
             cell_text = " ".join(
                 cell.get("text", "")
                 for row in table_struct.get("rows", [])
@@ -680,6 +774,10 @@ def build_structured_json(
                 if isinstance(cell, dict)
             )
             table_entities = _extract_entities(cell_text)
+            for ei, ent in enumerate(table_entities, 1):
+                ent["entity_id"] = f"{table_id}_e{ei:03d}"
+                if ent.get("type") == "material" and ent.get("canonical_id") is None:
+                    ent["canonical_id"] = None
             table_units = _extract_table_units(table_struct.get("rows", []))
 
             tables.append({
@@ -694,6 +792,7 @@ def build_structured_json(
             })
 
             blocks.append({
+                "block_id": block_id,
                 "type": "table",
                 "table_id": table_id,
                 "provenance": base_prov | {"paragraph_index": paragraph_index},
@@ -706,9 +805,14 @@ def build_structured_json(
                 if m:
                     table_no = m.group(1)
                 cap_entities = _extract_entities(cap)
+                for ei, ent in enumerate(cap_entities, 1):
+                    ent["entity_id"] = f"{table_id}_cap_e{ei:03d}"
                 cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
+                for ri, rel in enumerate(cap_relations, 1):
+                    rel["relation_id"] = f"{table_id}_cap_r{ri:03d}"
                 cap_block_id = f"{table_id}_cap_{len(blocks)}"
                 blocks.append({
+                    "block_id": cap_block_id,
                     "type": "table_caption",
                     "text": cap,
                     "table_no": table_no,
@@ -740,6 +844,7 @@ def build_structured_json(
             })
 
             blocks.append({
+                "block_id": block_id,
                 "type": "figure",
                 "figure_id": fig_id,
                 "provenance": base_prov | {"paragraph_index": paragraph_index},
@@ -752,9 +857,14 @@ def build_structured_json(
                 if m:
                     fig_no = m.group(1)
                 cap_entities = _extract_entities(cap)
+                for ei, ent in enumerate(cap_entities, 1):
+                    ent["entity_id"] = f"{fig_id}_cap_e{ei:03d}"
                 cap_relations = _bind_metric_values(cap, cap_entities, sentence_id=paragraph_index)
+                for ri, rel in enumerate(cap_relations, 1):
+                    rel["relation_id"] = f"{fig_id}_cap_r{ri:03d}"
                 cap_block_id = f"{fig_id}_cap_{len(blocks)}"
                 blocks.append({
+                    "block_id": cap_block_id,
                     "type": "figure_caption",
                     "text": cap,
                     "figure_no": fig_no,
@@ -769,6 +879,7 @@ def build_structured_json(
 
         # 其他类型直接落盘为 raw block
         blocks.append({
+            "block_id": block_id,
             "type": btype or "unknown",
             "raw": item,
             "provenance": base_prov | {"paragraph_index": paragraph_index},
@@ -815,6 +926,36 @@ def build_structured_json(
         inid = _extract_inid_metadata(blocks)
         if inid:
             output["metadata"] = inid | {"source": "inid"}
+
+    # experiments 聚合（示例/对比/合成等）
+    experiments_map: dict[str, dict[str, Any]] = {}
+    for blk in blocks:
+        ex_id = blk.get("example_id")
+        if not ex_id:
+            continue
+        exp = experiments_map.setdefault(
+            ex_id,
+            {
+                "example_id": ex_id,
+                "materials_used": [],
+                "performance": [],
+                "source_block_ids": [],
+            },
+        )
+        exp["source_block_ids"].append(blk.get("provenance", {}).get("block_id"))
+        for ent in blk.get("entities", []):
+            if ent.get("type") == "material":
+                exp["materials_used"].append(ent.get("entity_id"))
+        for rel in blk.get("relations", []):
+            exp["performance"].append(rel.get("relation_id"))
+    output["experiments"] = list(experiments_map.values())
+
+    # Pydantic 数据契约校验
+    if BaseModel:
+        doc = DocumentModel(**output)
+        output = doc.model_dump()
+    else:
+        logger.warning("未安装 pydantic，跳过数据契约校验")
 
     out_path = doc_dir / f"{stem}_structured.json"
     out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
