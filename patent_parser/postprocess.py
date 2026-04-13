@@ -218,9 +218,25 @@ for _r in _ROLE_KEYWORDS:
     _role_pat = re.escape(_r).replace(r"\ ", r"\s+")
     _ROLE_PATTERNS.append((_r, re.compile(rf"\b{_role_pat}\b", re.I)))
 
+_SUPERSCRIPT_TRANS = str.maketrans({
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "⁻": "-", "⁺": "+",
+})
+
 _UNIT_RE = re.compile(
-    r"(?P<value>[-+]?\d+(?:\.\d+)?(?:\s*×\s*10\^[-+]?\d+)?)\s*(?P<unit>"
-    r"cd/m2|cd\s*m-2|mA/cm2|A/cm2|A/m2|V|nm|eV|%|h|hr|hours|K|°C|C|mW/cm2"
+    r"(?P<value>[-+]?\d+(?:\.\d+)?"
+    r"(?:\s*(?:×|x|X)\s*10(?:\^)?\s*[-+−⁻⁺]?(?:\d+|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)"
+    r"|[eE][-+]?\d+)?)\s*(?P<unit>"
+    r"cd\s*/\s*m(?:2|²)"
+    r"|cd\s*[*·]?\s*m(?:-2|⁻²)"
+    r"|mA\s*/\s*cm(?:2|²)"
+    r"|A\s*/\s*cm(?:2|²)"
+    r"|A\s*/\s*m(?:2|²)"
+    r"|mW\s*/\s*cm(?:2|²)"
+    r"|cd\s*/\s*A"
+    r"|lm\s*/\s*W"
+    r"|V|nm|eV|%|h|hr|hours|K|°C|C"
     r")",
     re.I,
 )
@@ -235,6 +251,11 @@ _MATERIAL_RE = re.compile(
     r")\b"
 )
 _MATERIAL_STOP = {"FIG", "TABLE", "EXAMPLE", "OLED", "PCT", "WO", "US", "EP"}
+_MATERIAL_HINT_RE = re.compile(
+    r"\b(host|dopant|emitter|acceptor|donor|compound|material|layer|"
+    r"htl|etl|eml|hil|eil|hbl|ebl)\b|主体|客体|掺杂|化合物|材料|传输层|发光层|注入层",
+    re.I,
+)
 
 
 class _SimpleHTMLTableParser(HTMLParser):
@@ -312,7 +333,7 @@ def _extract_table_units(rows: list[list[dict]]) -> list[str]:
                 continue
             text = cell.get("text", "")
             for m in _UNIT_RE.finditer(text):
-                units.add(m.group("unit"))
+                units.add(_normalize_unit(m.group("unit")))
             # 括号内单位
             for m in re.findall(r"\(([^)]+)\)", text):
                 if len(m) <= 12:
@@ -373,13 +394,52 @@ def _classify_text_block(text: str, context: dict) -> str:
     return "text"
 
 
+def _normalize_unit(unit: str) -> str:
+    s = unit.strip().lower().replace(" ", "")
+    s = s.replace("·", "*").replace("−", "-").replace("⁻", "-").replace("²", "2")
+    if s in {"cd/m2", "cd*m-2"}:
+        return "cd/m2"
+    if s == "ma/cm2":
+        return "mA/cm2"
+    if s == "a/cm2":
+        return "A/cm2"
+    if s == "a/m2":
+        return "A/m2"
+    if s == "mw/cm2":
+        return "mW/cm2"
+    if s == "cd/a":
+        return "cd/A"
+    if s == "lm/w":
+        return "lm/W"
+    if s == "ev":
+        return "eV"
+    if s == "hr":
+        return "hr"
+    return unit.strip()
+
+
+def _has_material_context(text: str, span: list[int], token: str) -> bool:
+    # 类似 US20230123456A1 的专利号片段，直接过滤
+    if re.match(r"^[A-Z]{2}\d{4,}[A-Z0-9]*$", token):
+        return False
+    # 化学式类（含数字）优先保留，避免过度过滤 Alq3/Ir(ppy)3 风格名称
+    if any(ch.isdigit() for ch in token):
+        return True
+    window = 48
+    start = max(0, span[0] - window)
+    end = min(len(text), span[1] + window)
+    return _MATERIAL_HINT_RE.search(text[start:end]) is not None
+
+
 def _extract_entities(text: str) -> list[dict]:
     entities: list[dict] = []
     if not text:
         return entities
 
     def _parse_value(raw: str) -> float | None:
-        raw_norm = raw.replace("×", "x").replace(" ", "")
+        raw_norm = raw.replace(" ", "")
+        raw_norm = raw_norm.translate(_SUPERSCRIPT_TRANS)
+        raw_norm = raw_norm.replace("×", "x").replace("−", "-").replace("⁻", "-")
         sci = re.match(r"^([+-]?\d+(?:\.\d+)?)[xX]10\^?([+-]?\d+)$", raw_norm)
         if sci:
             try:
@@ -393,7 +453,7 @@ def _extract_entities(text: str) -> list[dict]:
 
     for m in _UNIT_RE.finditer(text):
         raw_val = m.group("value")
-        unit = m.group("unit")
+        unit = _normalize_unit(m.group("unit"))
         span = [m.start(), m.end()]
         val = _parse_value(raw_val)
         entities.append({
@@ -430,13 +490,16 @@ def _extract_entities(text: str) -> list[dict]:
 
     for m in _MATERIAL_RE.finditer(text):
         token = m.group(0)
+        span = [m.start(), m.end()]
         if token.upper() in _MATERIAL_STOP:
+            continue
+        if not _has_material_context(text, span, token):
             continue
         entities.append({
             "type": "material",
             "value": token,
             "normalized": token.lower(),
-            "span": [m.start(), m.end()],
+            "span": span,
         })
 
     for key, canonical in _LAYER_SYNONYMS.items():

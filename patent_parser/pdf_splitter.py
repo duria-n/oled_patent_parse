@@ -49,13 +49,28 @@ def get_page_count(pdf_path: Path) -> int:
     raise RuntimeError("需要 PyMuPDF 或 pypdf 才能获取 PDF 页数，请安装其中之一")
 
 
-def split_pdf(pdf_path: Path, chunk_size: int = PAGE_LIMIT) -> list[Path]:
+def split_pdf(
+    pdf_path: Path,
+    chunk_size: int = PAGE_LIMIT,
+    parent_dir: Path | None = None,
+) -> list[Path]:
     """将 PDF 切分为多个不超过 chunk_size 页的子文件。
 
     返回临时目录中的分片路径列表，调用方负责在使用完毕后删除该临时目录
     （即 ``shutil.rmtree(parts[0].parent)``）。
+
+    ``parent_dir`` 可以指定切片所在父目录（默认使用系统 /tmp）。指定后
+    切片写到 ``parent_dir / f"patent_split_{stem}"``，便于与输出目录一起
+    受到启动清理扫描。
     """
-    tmp_dir = Path(tempfile.mkdtemp(prefix=f"patent_split_{pdf_path.stem}_"))
+    if parent_dir is None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"patent_split_{pdf_path.stem}_"))
+    else:
+        parent_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = parent_dir / f"patent_split_{pdf_path.stem}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
     try:
         try:
             import fitz
@@ -144,12 +159,13 @@ def _find_part_file(part_stem: str, output_dir: Path, suffix: str) -> Path | Non
     candidate = part_out_dir / f"{part_stem}{suffix}"
     if candidate.exists():
         return candidate
+    filename = f"{part_stem}{suffix}"
     if part_out_dir.is_dir():
-        hits = [p for p in part_out_dir.rglob(f"*{suffix}") if p.stem == f"{part_stem}{suffix[:-len(suffix)]}"]
+        hits = [p for p in part_out_dir.rglob(filename) if p.is_file()]
         if hits:
             hits.sort(key=lambda p: (len(p.parts), len(str(p))))
             return hits[0]
-    hits = [p for p in output_dir.rglob(f"*{suffix}") if p.stem == f"{part_stem}{suffix[:-len(suffix)]}"]
+    hits = [p for p in output_dir.rglob(filename) if p.is_file()]
     if hits:
         hits.sort(key=lambda p: (len(p.parts), len(str(p))))
         return hits[0]
@@ -166,12 +182,23 @@ def _rewrite_img_path(img_path: str, part_stem: str) -> str:
             return f"{prefix}{part_stem}_{base}"
     return img_path
 
+
+def _extract_part_number(part_stem: str) -> int | None:
+    m = re.search(r"_part(\d+)$", part_stem, re.I)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
 def merge_content_list_parts(
     part_paths: list[Path],
     output_dir: Path,
     original_stem: str,
     *,
     require_all_parts: bool = True,
+    chunk_size: int = PAGE_LIMIT,
 ) -> Path | None:
     merged_dir = output_dir / original_stem
     merged_dir.mkdir(parents=True, exist_ok=True)
@@ -180,10 +207,11 @@ def merge_content_list_parts(
     merged_list: list[dict] = []
     missing_parts: list[str] = []
     invalid_parts: list[str] = []
-    page_offset = 0
-
-    for part_path in sorted(part_paths, key=_natural_sort_key):
+    sorted_parts = sorted(part_paths, key=_natural_sort_key)
+    for i, part_path in enumerate(sorted_parts, 1):
         part_stem = part_path.stem
+        part_no = _extract_part_number(part_stem) or i
+        absolute_page_offset = (part_no - 1) * chunk_size
         part_json = _find_part_file(part_stem, output_dir, "_content_list.json")
         if part_json is None:
             missing_parts.append(part_stem)
@@ -200,7 +228,6 @@ def merge_content_list_parts(
             logger.warning("分片 %s content_list 格式异常：根节点不是 list", part_stem)
             continue
         part_items: list[dict] = []
-        max_page = -1
         for item in data:
             if not isinstance(item, dict):
                 invalid_parts.append(part_stem)
@@ -215,15 +242,12 @@ def merge_content_list_parts(
                 break
             item_copy = dict(item)
             if isinstance(page_idx, int):
-                item_copy["page_idx"] = page_idx + page_offset
-                max_page = max(max_page, item_copy["page_idx"])
+                item_copy["page_idx"] = page_idx + absolute_page_offset
             if isinstance(item_copy.get("img_path"), str):
                 item_copy["img_path"] = _rewrite_img_path(item_copy["img_path"], part_stem)
             part_items.append(item_copy)
         if not part_items and data:
             continue
-        if max_page >= 0:
-            page_offset = max_page + 1
         merged_list.extend(part_items)
 
     if require_all_parts and (missing_parts or invalid_parts):
@@ -249,6 +273,7 @@ def merge_middle_json_parts(
     original_stem: str,
     *,
     require_all_parts: bool = True,
+    chunk_size: int = PAGE_LIMIT,
 ) -> Path | None:
     merged_dir = output_dir / original_stem
     merged_dir.mkdir(parents=True, exist_ok=True)
@@ -257,12 +282,14 @@ def merge_middle_json_parts(
     merged_pages: list[dict] = []
     missing_parts: list[str] = []
     invalid_parts: list[str] = []
-    page_offset = 0
     backend = None
     version = None
 
-    for part_path in sorted(part_paths, key=_natural_sort_key):
+    sorted_parts = sorted(part_paths, key=_natural_sort_key)
+    for i, part_path in enumerate(sorted_parts, 1):
         part_stem = part_path.stem
+        part_no = _extract_part_number(part_stem) or i
+        absolute_page_offset = (part_no - 1) * chunk_size
         part_json = _find_part_file(part_stem, output_dir, "_middle.json")
         if part_json is None:
             missing_parts.append(part_stem)
@@ -299,12 +326,10 @@ def merge_middle_json_parts(
                 broken = True
                 break
             if isinstance(page_idx, int):
-                page_copy["page_idx"] = page_idx + page_offset
+                page_copy["page_idx"] = page_idx + absolute_page_offset
             part_pages.append(page_copy)
         if broken:
             continue
-        if part_pages:
-            page_offset += len(part_pages)
         merged_pages.extend(part_pages)
         backend = backend or data.get("_backend")
         version = version or data.get("_version_name")
@@ -353,6 +378,7 @@ def merge_markdown_parts(
     original_stem: str,
     *,
     require_all_parts: bool = True,
+    cleanup_part_dirs: bool = False,
 ) -> Path | None:
     """合并各分片的 Markdown。
 
@@ -364,8 +390,6 @@ def merge_markdown_parts(
 
     chunks: list[str] = []
     missing_parts: list[str] = []
-    part_dirs_to_remove: list[Path] = []
-
     for part_path in sorted(part_paths, key=_natural_sort_key):
         part_stem = part_path.stem
         md_file = _find_md_for_part(part_stem, output_dir, merged_md)
@@ -396,10 +420,6 @@ def merge_markdown_parts(
         content = _replace_local_resource_refs(content, rename_map)
         chunks.append(content)
 
-        part_top_dir = output_dir / part_stem
-        if part_top_dir.is_dir() and part_top_dir != merged_dir and part_top_dir not in part_dirs_to_remove:
-            part_dirs_to_remove.append(part_top_dir)
-
     if require_all_parts and missing_parts:
         logger.error(
             "存在 %d 个缺失分片 md，不生成正式合并文件: %s",
@@ -419,8 +439,69 @@ def merge_markdown_parts(
     merged_md.write_text("\n\n".join(chunks), encoding="utf-8")
     logger.info("合并 %d 片 → %s", len(chunks), merged_md)
 
-    for part_dir in part_dirs_to_remove:
+    if cleanup_part_dirs:
+        cleanup_part_output_dirs(part_paths, output_dir)
+
+    return merged_md
+
+
+def cleanup_part_output_dirs(part_paths: list[Path], output_dir: Path) -> None:
+    """清理每个分片在 output_dir 下的输出目录。"""
+    for part_path in sorted(part_paths, key=_natural_sort_key):
+        part_dir = output_dir / part_path.stem
+        if not part_dir.exists() or not part_dir.is_dir():
+            continue
         shutil.rmtree(part_dir, ignore_errors=True)
         logger.debug("已清理分片目录: %s", part_dir)
 
-    return merged_md
+
+def cleanup_orphan_split_dirs(*roots: Path) -> int:
+    """扫描并清理遗留的切分临时目录。
+
+    遍历 ``roots`` 以及 ``/tmp``，将形如 ``patent_split_*`` 的空/孤目录删除。
+    返回清理的目录数量。用于主进程启动时打扫上次 crash 残留。
+    """
+    removed = 0
+    seen: set[Path] = set()
+
+    candidates: list[Path] = []
+    for root in roots:
+        if root is None:
+            continue
+        try:
+            root = Path(root)
+        except TypeError:
+            continue
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            # 直接子目录 + 深一层 _splits 子目录
+            for child in root.rglob("patent_split_*"):
+                if child.is_dir():
+                    candidates.append(child)
+        except OSError:
+            pass
+
+    try:
+        tmp = Path(tempfile.gettempdir())
+        for child in tmp.glob("patent_split_*"):
+            if child.is_dir():
+                candidates.append(child)
+    except OSError:
+        pass
+
+    for c in candidates:
+        try:
+            rc = c.resolve()
+        except OSError:
+            rc = c
+        if rc in seen:
+            continue
+        seen.add(rc)
+        try:
+            shutil.rmtree(c, ignore_errors=True)
+            removed += 1
+            logger.info("清理残留切分目录: %s", c)
+        except OSError:
+            pass
+    return removed

@@ -8,14 +8,19 @@ from .config import PATENT_PREFIX_LANG, WIPO_LANG_MAP, logger
 from .wipo_metadata import WIPOMetadataProvider, normalize_wo_pubno
 
 
-def _detect_lang_by_filename(pdf_path: Path, allowed_langs: list[str] | None) -> str | None:
-    """根据专利文件名前缀判断语言，命中则返回 MinerU 语言代码，否则返回 None。"""
+def _detect_prefix_lang(pdf_path: Path) -> tuple[str | None, str | None]:
+    """返回 (prefix, mapped_lang)。未命中时为 (None, None)。"""
     stem = pdf_path.stem
     m = re.match(r"^([A-Z]{2})", stem, re.I)
     if not m:
-        return None
+        return None, None
     prefix = m.group(1).upper()
-    lang = PATENT_PREFIX_LANG.get(prefix)
+    return prefix, PATENT_PREFIX_LANG.get(prefix)
+
+
+def _detect_lang_by_filename(pdf_path: Path, allowed_langs: list[str] | None) -> str | None:
+    """根据专利文件名前缀判断语言，命中则返回 MinerU 语言代码，否则返回 None。"""
+    _, lang = _detect_prefix_lang(pdf_path)
     if lang is None:
         return None
     if allowed_langs and lang not in allowed_langs:
@@ -68,6 +73,7 @@ def detect_pdf_language(
     """
     fallback = allowed_langs[0] if allowed_langs else "en"
 
+    prefix, prefix_lang_all = _detect_prefix_lang(pdf_path)
     prefix_lang = _detect_lang_by_filename(pdf_path, allowed_langs)
     wipo_pub_lang = None
 
@@ -101,7 +107,16 @@ def detect_pdf_language(
     elif lang_source == "prefix":
         logger.info("根据文件名前缀判断 %s 语言: %s", pdf_path.name, lang)
     else:
-        logger.warning("无法从文件名 %s 判断语言，使用默认语言 %s", pdf_path.name, fallback)
+        if prefix and prefix_lang_all and allowed_langs and prefix_lang_all not in allowed_langs:
+            logger.warning(
+                "文件名前缀 %s -> %s，但不在允许语言列表内，回退为默认语言 %s (%s)",
+                prefix,
+                prefix_lang_all,
+                fallback,
+                pdf_path.name,
+            )
+        else:
+            logger.warning("无法从文件名 %s 判断语言，使用默认语言 %s", pdf_path.name, fallback)
 
     is_scanned = _is_scanned_pdf(pdf_path)
     if is_scanned:

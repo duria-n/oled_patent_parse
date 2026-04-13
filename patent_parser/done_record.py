@@ -18,9 +18,12 @@ class DoneRecord:
     }
     """
 
-    def __init__(self, output_dir: Path):
+    _DONE_STATUSES = {"done", "done_without_tables"}
+
+    def __init__(self, output_dir: Path, parser_version: str | None = None):
         self.path = output_dir / DONE_FILENAME
         self._data: dict = self._load()
+        self.parser_version = parser_version
 
     def _load(self) -> dict:
         if self.path.exists():
@@ -38,7 +41,13 @@ class DoneRecord:
 
     def is_done(self, pdf_name: str) -> bool:
         entry = self._data.get(pdf_name)
-        return entry is not None and entry.get("status") == "done"
+        if entry is None:
+            return False
+        if entry.get("status") not in self._DONE_STATUSES:
+            return False
+        if self.parser_version is None:
+            return True
+        return entry.get("parser_version") == self.parser_version
 
     def is_failed(self, pdf_name: str) -> bool:
         entry = self._data.get(pdf_name)
@@ -56,12 +65,14 @@ class DoneRecord:
             entry["error_msg"] = error_msg[:500]
         for k, v in extra.items():
             entry[k] = v
+        if self.parser_version and "parser_version" not in entry:
+            entry["parser_version"] = self.parser_version
         self._data[pdf_name] = entry
         self._save()
 
     @property
     def done_count(self) -> int:
-        return sum(1 for v in self._data.values() if v.get("status") == "done")
+        return sum(1 for v in self._data.values() if v.get("status") in self._DONE_STATUSES)
 
     @property
     def failed_count(self) -> int:

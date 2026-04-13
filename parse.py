@@ -2,11 +2,23 @@
 
 import argparse
 import logging
+import multiprocessing
 import signal
 import sys
+from datetime import datetime
+from pathlib import Path
 
-from patent_parser.config import SUPPORTED_LANGS
-from patent_parser.mineru_parser import MinerUPatentParser
+# 在 import 任何涉及 CUDA / torch 的模块之前就切到 spawn：
+# fork 默认启动方式会把父进程（已初始化 logger / CUDA context）的 fd 表和
+# 驱动状态一并带进 worker，日志行会相互交错，CUDA context 也可能失效。
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    # 已经被别处设置过就忽略（例如被测试框架预先设置）
+    pass
+
+from patent_parser.config import SUPPORTED_LANGS, add_file_logger
+from patent_parser.mineru_parser import MinerUPatentParser, PARSER_VERSION
 
 logger = logging.getLogger("patent_parser")
 
@@ -72,7 +84,31 @@ def main():
                     help="保留原始 raw 字段（默认会丢弃以减小 JSON 体积）")
     ap.add_argument("--no-postprocess", action="store_true",
                     help="禁用结构化后处理 JSON 输出")
+    ap.add_argument("--parser-version", default=PARSER_VERSION,
+                    help=f"done.json 版本标记（默认 {PARSER_VERSION}），变化时会自动重处理旧 done 项")
+    ap.add_argument("--timeout-minutes", type=float, default=30.0,
+                    help="单个 PDF/分片解析超时时间（分钟，默认 30）")
+    ap.add_argument("--render-workers", type=int, default=0,
+                    help="MinerU 内层 PDF 渲染并发进程数（每个外层任务）。\n"
+                         "默认 0 = 自动按 CPU 数 / workers 计算（上限 16）。\n"
+                         "强制串行（设为 1）会让单 PDF 渲染时间被放大到几十分钟，"
+                         "极易撞 --timeout-minutes 而失败。")
+    ap.add_argument("--log-file", default=None,
+                    help="日志文件路径（默认输出到 output/logs/run_YYYYmmdd_HHMMSS.log）")
     args = ap.parse_args()
+    if args.timeout_minutes <= 0:
+        ap.error("--timeout-minutes 必须大于 0")
+    if args.render_workers < 0:
+        ap.error("--render-workers 必须 >= 0")
+
+    # Setup file logging
+    if args.log_file:
+        log_path = Path(args.log_file)
+    else:
+        base_out = Path(args.output) if args.output else (Path(args.input) / "output")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = base_out / "logs" / f"run_{ts}.log"
+    add_file_logger(log_path)
 
     lang_display = ",".join(args.lang)
     logger.info("语言: %s | 后端: %s | 方法: %s | workers: %d",
@@ -80,8 +116,14 @@ def main():
     logger.info("公式解析: %s | 表格解析: %s",
                 "开启" if not args.no_formula else "关闭",
                 "开启" if not args.no_table else "关闭")
+    logger.info("单任务超时: %.1f 分钟", args.timeout_minutes)
+    if args.render_workers == 0:
+        logger.info("MinerU 内层渲染并发: 自动（按 CPU 数 / workers 计算）")
+    else:
+        logger.info("MinerU 内层渲染并发: %d", args.render_workers)
     if args.gpus:
         logger.info("指定 GPU: %s", args.gpus)
+    logger.info("日志文件: %s", log_path)
 
     parser = MinerUPatentParser(
         input_root=args.input,
@@ -97,6 +139,9 @@ def main():
         postprocess_enable=not args.no_postprocess,
         biblio_metadata_path=args.biblio_metadata,
         keep_raw=args.keep_raw,
+        parser_version=args.parser_version,
+        parse_timeout_sec=max(1, int(args.timeout_minutes * 60)),
+        render_workers=args.render_workers,
     )
 
     # 捕获 Ctrl+C：打印提示后正常退出，让底层清理逻辑（finally 块）有机会执行

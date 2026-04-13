@@ -1,12 +1,26 @@
 """常量与配置。"""
 
 import logging
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("patent_parser")
+
+def add_file_logger(log_path: str | Path, level: int = logging.INFO) -> Path:
+    path = Path(log_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Avoid duplicate handlers for the same file
+    for h in logger.handlers:
+        if isinstance(h, logging.FileHandler) and Path(h.baseFilename) == path:
+            return path
+    handler = logging.FileHandler(path, encoding="utf-8")
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    return path
 
 DONE_FILENAME = "done.json"
 
