@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from contextlib import contextmanager
 
 from .config import PostgresConfig
@@ -221,20 +222,14 @@ class PostgresPatentStore:
             cur.execute(f"DELETE FROM {schema}.block WHERE doc_id = %s", (doc.doc_id,))
             cur.execute(f"DELETE FROM {schema}.molecule WHERE doc_id = %s", (doc.doc_id,))
 
+            block_rows: list[dict] = []
+            entity_rows: list[dict] = []
+            relation_rows: list[dict] = []
+            experiment_rows: list[dict] = []
+            molecule_rows: list[tuple[str, str, str, str]] = []
+
             for block in doc.blocks:
-                cur.execute(
-                    f"""
-                    INSERT INTO {schema}.block(
-                        block_id, doc_id, block_type, text, section, subsection, example_id,
-                        claim_no, depends_on, table_id, table_no, figure_id, figure_no,
-                        char_offset, provenance, raw
-                    ) VALUES (
-                        %(block_id)s, %(doc_id)s, %(block_type)s, %(text)s, %(section)s,
-                        %(subsection)s, %(example_id)s, %(claim_no)s, %(depends_on)s::jsonb,
-                        %(table_id)s, %(table_no)s, %(figure_id)s, %(figure_no)s,
-                        %(char_offset)s, %(provenance)s::jsonb, %(raw)s::jsonb
-                    );
-                    """,
+                block_rows.append(
                     {
                         "block_id": block.block_id,
                         "doc_id": doc.doc_id,
@@ -254,23 +249,13 @@ class PostgresPatentStore:
                         "char_offset": block.char_offset,
                         "provenance": json.dumps(block.provenance, ensure_ascii=False),
                         "raw": json.dumps(block.raw, ensure_ascii=False),
-                    },
+                    }
                 )
 
                 for entity in block.entities:
                     raw_json = json.dumps(entity.raw, ensure_ascii=False)
                     smiles = self._extract_smiles(entity)
-                    cur.execute(
-                        f"""
-                        INSERT INTO {schema}.entity(
-                            entity_id, doc_id, block_id, entity_type, value_text, value_num,
-                            unit, value_pair, span, normalized, canonical_id, smiles, raw
-                        ) VALUES (
-                            %(entity_id)s, %(doc_id)s, %(block_id)s, %(entity_type)s, %(value_text)s,
-                            %(value_num)s, %(unit)s, %(value_pair)s, %(span)s, %(normalized)s,
-                            %(canonical_id)s, %(smiles)s, %(raw)s::jsonb
-                        );
-                        """,
+                    entity_rows.append(
                         {
                             "entity_id": entity.entity_id,
                             "doc_id": doc.doc_id,
@@ -285,37 +270,14 @@ class PostgresPatentStore:
                             "canonical_id": entity.canonical_id,
                             "smiles": smiles,
                             "raw": raw_json,
-                        },
+                        }
                     )
 
                     if smiles:
-                        # 单条无效 SMILES 不应导致整篇文档回滚。
-                        cur.execute("SAVEPOINT mol_insert_sp;")
-                        try:
-                            cur.execute(
-                                f"""
-                                INSERT INTO {schema}.molecule(doc_id, entity_id, smiles, mol)
-                                VALUES (%s, %s, %s, mol_from_smiles(%s));
-                                """,
-                                (doc.doc_id, entity.entity_id, smiles, smiles),
-                            )
-                        except Exception:
-                            cur.execute("ROLLBACK TO SAVEPOINT mol_insert_sp;")
-                        finally:
-                            cur.execute("RELEASE SAVEPOINT mol_insert_sp;")
+                        molecule_rows.append((doc.doc_id, entity.entity_id, smiles, smiles))
 
                 for relation in block.relations:
-                    cur.execute(
-                        f"""
-                        INSERT INTO {schema}.relation(
-                            relation_id, doc_id, block_id, relation_type, source_entity_id,
-                            target_entity_id, confidence, rule, distance, sentence_id, raw
-                        ) VALUES (
-                            %(relation_id)s, %(doc_id)s, %(block_id)s, %(relation_type)s,
-                            %(source_entity_id)s, %(target_entity_id)s, %(confidence)s,
-                            %(rule)s, %(distance)s, %(sentence_id)s, %(raw)s::jsonb
-                        );
-                        """,
+                    relation_rows.append(
                         {
                             "relation_id": relation.relation_id,
                             "doc_id": doc.doc_id,
@@ -328,11 +290,69 @@ class PostgresPatentStore:
                             "distance": relation.distance,
                             "sentence_id": relation.sentence_id,
                             "raw": json.dumps(relation.raw, ensure_ascii=False),
-                        },
+                        }
                     )
 
             for experiment in doc.experiments:
-                cur.execute(
+                experiment_rows.append(
+                    {
+                        "experiment_id": f"{doc.doc_id}::{experiment.example_id}",
+                        "example_id": experiment.example_id,
+                        "doc_id": doc.doc_id,
+                        "materials_used": experiment.materials_used,
+                        "performance_relations": experiment.performance_relations,
+                        "role_relations": experiment.role_relations,
+                        "source_block_ids": experiment.source_block_ids,
+                        "raw": json.dumps(experiment.raw, ensure_ascii=False),
+                    }
+                )
+
+            if block_rows:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {schema}.block(
+                        block_id, doc_id, block_type, text, section, subsection, example_id,
+                        claim_no, depends_on, table_id, table_no, figure_id, figure_no,
+                        char_offset, provenance, raw
+                    ) VALUES (
+                        %(block_id)s, %(doc_id)s, %(block_type)s, %(text)s, %(section)s,
+                        %(subsection)s, %(example_id)s, %(claim_no)s, %(depends_on)s::jsonb,
+                        %(table_id)s, %(table_no)s, %(figure_id)s, %(figure_no)s,
+                        %(char_offset)s, %(provenance)s::jsonb, %(raw)s::jsonb
+                    );
+                    """,
+                    block_rows,
+                )
+            if entity_rows:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {schema}.entity(
+                        entity_id, doc_id, block_id, entity_type, value_text, value_num,
+                        unit, value_pair, span, normalized, canonical_id, smiles, raw
+                    ) VALUES (
+                        %(entity_id)s, %(doc_id)s, %(block_id)s, %(entity_type)s, %(value_text)s,
+                        %(value_num)s, %(unit)s, %(value_pair)s, %(span)s, %(normalized)s,
+                        %(canonical_id)s, %(smiles)s, %(raw)s::jsonb
+                    );
+                    """,
+                    entity_rows,
+                )
+            if relation_rows:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {schema}.relation(
+                        relation_id, doc_id, block_id, relation_type, source_entity_id,
+                        target_entity_id, confidence, rule, distance, sentence_id, raw
+                    ) VALUES (
+                        %(relation_id)s, %(doc_id)s, %(block_id)s, %(relation_type)s,
+                        %(source_entity_id)s, %(target_entity_id)s, %(confidence)s,
+                        %(rule)s, %(distance)s, %(sentence_id)s, %(raw)s::jsonb
+                    );
+                    """,
+                    relation_rows,
+                )
+            if experiment_rows:
+                cur.executemany(
                     f"""
                     INSERT INTO {schema}.experiment(
                         experiment_id, example_id, doc_id, materials_used, performance_relations,
@@ -350,17 +370,10 @@ class PostgresPatentStore:
                         source_block_ids = EXCLUDED.source_block_ids,
                         raw = EXCLUDED.raw;
                     """,
-                    {
-                        "experiment_id": f"{doc.doc_id}::{experiment.example_id}",
-                        "example_id": experiment.example_id,
-                        "doc_id": doc.doc_id,
-                        "materials_used": experiment.materials_used,
-                        "performance_relations": experiment.performance_relations,
-                        "role_relations": experiment.role_relations,
-                        "source_block_ids": experiment.source_block_ids,
-                        "raw": json.dumps(experiment.raw, ensure_ascii=False),
-                    },
+                    experiment_rows,
                 )
+            if molecule_rows:
+                self._insert_molecules_resilient(cur, schema, molecule_rows)
 
             if sync_graph:
                 self._sync_age_graph(cur, doc)
@@ -391,29 +404,7 @@ class PostgresPatentStore:
             (graph, json.dumps({"doc_id": doc.doc_id})),
         )
 
-        # 兜底清理：把所有孤儿 Block/Entity 清掉，防止历史脏数据累积
-        cur.execute(
-            """
-            SELECT * FROM cypher(%s, $$
-                MATCH (b:Block)
-                WHERE NOT (:Document)-[:HAS_BLOCK]->(b)
-                DETACH DELETE b
-                RETURN 1
-            $$) AS (v agtype);
-            """,
-            (graph,),
-        )
-        cur.execute(
-            """
-            SELECT * FROM cypher(%s, $$
-                MATCH (e:Entity)
-                WHERE NOT (:Block)-[:HAS_ENTITY]->(e)
-                DETACH DELETE e
-                RETURN 1
-            $$) AS (v agtype);
-            """,
-            (graph,),
-        )
+        # 不在热路径做全图孤儿扫描；孤儿清理交给离线维护任务。
 
         # 创建文档节点
         cur.execute(
@@ -562,9 +553,11 @@ class PostgresPatentStore:
                 if value:
                     return value
 
-        # Heuristic：过滤明显非结构标记，允许常见 SMILES 字符集。
+        # Heuristic：过滤明显非结构标记，尽量减少误判。
         allowed_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@+-[]=#$()\\/%.")
         banned_tokens = {"PENDING_MAPPING", "UNKNOWN", "N/A", "NA"}
+        likely_smiles_markers = set("[]=#@()/\\")
+        simple_organic_chain = re.compile(r"^(?:Br|Cl|[BCNOPSFIbcnops]){2,}$")
         for raw in candidates:
             text = raw.strip()
             if not text or text in banned_tokens:
@@ -575,11 +568,70 @@ class PostgresPatentStore:
                 continue
             if any(ch not in allowed_chars for ch in text):
                 continue
+            # OLED 专利场景以有机分子为主；缺碳的简写代号误判风险高。
+            carbon_count = text.count("C") + text.count("c")
+            if carbon_count < 2:
+                continue
             if not any(ch.isalpha() for ch in text):
                 continue
+            # 至少包含一个更像化学结构表达的特征，避免普通词/编号被误判。
+            if not any(ch in likely_smiles_markers for ch in text):
+                # 允许更典型的芳香原子小写写法或环编号模式作为例外
+                if not (
+                    re.search(r"[bcnops]|[0-9].*[A-Za-z]|[A-Za-z].*[0-9]", text)
+                    or simple_organic_chain.fullmatch(text)
+                ):
+                    continue
             return text
 
         return None
+
+    @staticmethod
+    def _insert_molecules_resilient(cur, schema: str, molecule_rows: list[tuple[str, str, str, str]]) -> None:
+        for row in molecule_rows:
+            # 单条无效 SMILES 不应导致整篇文档回滚。
+            cur.execute("SAVEPOINT mol_insert_sp;")
+            try:
+                cur.execute(
+                    f"""
+                    INSERT INTO {schema}.molecule(doc_id, entity_id, smiles, mol)
+                    VALUES (%s, %s, %s, mol_from_smiles(%s));
+                    """,
+                    row,
+                )
+            except Exception:
+                cur.execute("ROLLBACK TO SAVEPOINT mol_insert_sp;")
+            finally:
+                cur.execute("RELEASE SAVEPOINT mol_insert_sp;")
+
+    def cleanup_age_orphans(self) -> None:
+        """离线维护：清理 AGE 图中的孤儿节点（避免在写入热路径全图扫描）。"""
+        graph = self.config.age_graph
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(f"SET search_path = ag_catalog, \"$user\", public, {self.config.schema};")
+            cur.execute(
+                """
+                SELECT * FROM cypher(%s, $$
+                    MATCH (b:Block)
+                    WHERE NOT (:Document)-[:HAS_BLOCK]->(b)
+                    DETACH DELETE b
+                    RETURN 1
+                $$) AS (v agtype);
+                """,
+                (graph,),
+            )
+            cur.execute(
+                """
+                SELECT * FROM cypher(%s, $$
+                    MATCH (e:Entity)
+                    WHERE NOT (:Block)-[:HAS_ENTITY]->(e)
+                    DETACH DELETE e
+                    RETURN 1
+                $$) AS (v agtype);
+                """,
+                (graph,),
+            )
+            conn.commit()
 
     def rdkit_substructure_search(self, smarts: str, limit: int = 20) -> list[dict]:
         schema = self.config.schema

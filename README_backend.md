@@ -46,6 +46,9 @@ python backend_pipeline.py --init-pg
 # 导入 PostgreSQL，并同步 AGE 图
 python backend_pipeline.py --ingest-pg --sync-age --inputs md output
 
+# （建议定期离线执行）清理 AGE 图孤儿节点
+python backend_pipeline.py --age-clean-orphans
+
 # 初始化 OpenSearch 索引（默认 embedder=auto：有 OPENAI_API_KEY 就用 OpenAI，否则回退 hash）
 python backend_pipeline.py --init-os --embedder auto --embed-dim 384
 

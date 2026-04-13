@@ -119,13 +119,18 @@ def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
     """
     import os as _os
 
+    fallback_reason: str | None = None
+    fallback_mode: str | None = None
     try:
         gpu_id = gpu_queue.get(timeout=10)
-    except Exception:
+    except Exception as exc:
+        fallback_reason = f"{type(exc).__name__}"
         if fallback_gpu_ids:
             gpu_id = fallback_gpu_ids[_os.getpid() % len(fallback_gpu_ids)]
+            fallback_mode = "pid_mod_fallback"
         else:
             gpu_id = 0
+            fallback_mode = "hardcoded_gpu0"
 
     gpu_str = str(gpu_id)
     _os.environ["WORKER_GPU_ID"] = gpu_str
@@ -149,6 +154,16 @@ def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
                 add_file_logger(log_path)
         except Exception:
             pass
+
+    if fallback_reason:
+        logger.warning(
+            "worker GPU 槽位获取失败（%s），已退化绑定 GPU=%s（mode=%s, candidates=%s）。"
+            "若频繁出现，可能导致单卡过载/OOM。",
+            fallback_reason,
+            gpu_str,
+            fallback_mode,
+            list(fallback_gpu_ids) if fallback_gpu_ids else [],
+        )
 
 
 class MinerUPatentParser(BasePDFParser):

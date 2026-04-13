@@ -34,6 +34,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--init-pg", action="store_true", help="初始化 PostgreSQL schema（含 RDKit/AGE）")
     ap.add_argument("--ingest-pg", action="store_true", help="导入 PostgreSQL 关系层")
     ap.add_argument("--sync-age", action="store_true", help="导入 PG 时同步 AGE 图")
+    ap.add_argument("--age-clean-orphans", action="store_true", help="离线清理 AGE 图孤儿节点")
 
     ap.add_argument("--init-os", action="store_true", help="初始化 OpenSearch 索引")
     ap.add_argument("--index-os", action="store_true", help="写入 OpenSearch 索引")
@@ -79,6 +80,7 @@ def main() -> int:
         [
             args.init_pg,
             args.ingest_pg,
+            args.age_clean_orphans,
             args.init_os,
             args.index_os,
             args.search_doc,
@@ -96,7 +98,14 @@ def main() -> int:
     pg_init_error: str | None = None
     os_init_error: str | None = None
 
-    if args.init_pg or args.ingest_pg or args.rdkit_substruct or args.rdkit_sim or args.healthcheck:
+    if (
+        args.init_pg
+        or args.ingest_pg
+        or args.age_clean_orphans
+        or args.rdkit_substruct
+        or args.rdkit_sim
+        or args.healthcheck
+    ):
         try:
             pg_cfg = PostgresConfig.from_env()
             pg_store = PostgresPatentStore(pg_cfg)
@@ -179,6 +188,11 @@ def main() -> int:
         for i, doc in enumerate(docs, 1):
             pg_store.upsert_document(doc, sync_graph=args.sync_age)
             logger.info("PG upsert [%d/%d] %s", i, len(docs), doc.doc_id)
+
+    if args.age_clean_orphans:
+        assert pg_store is not None
+        pg_store.cleanup_age_orphans()
+        logger.info("AGE 孤儿节点清理完成")
 
     if args.init_os:
         assert os_index is not None
