@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import defaultdict
 from contextlib import contextmanager
 
 from .config import PostgresConfig
 from .models import StructuredPatentDocument
+
+_MAT_ALIAS_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
 
 
 class PostgresPatentStore:
@@ -26,6 +30,240 @@ class PostgresPatentStore:
             yield conn
         finally:
             conn.close()
+
+    @staticmethod
+    def _normalize_material_alias_key(text: str | None) -> str:
+        if not text:
+            return ""
+        return _MAT_ALIAS_KEY_RE.sub("", str(text)).upper()
+
+    @staticmethod
+    def _fallback_material_canonical_id(text: str | None) -> str:
+        raw = str(text or "").strip().lower()
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12].upper() if raw else "0" * 12
+        return f"mat:RAW{digest}"
+
+    @classmethod
+    def _iter_material_alias_texts(cls, entity_row: dict) -> list[str]:
+        values: list[str] = []
+        for key in ("value_text", "normalized"):
+            raw = entity_row.get(key)
+            if not isinstance(raw, str):
+                continue
+            text = raw.strip()
+            if not text:
+                continue
+            values.append(text)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
+
+    @classmethod
+    def _collect_material_alias_keys(cls, entity_rows: list[dict]) -> list[str]:
+        keys: set[str] = set()
+        for row in entity_rows:
+            if row.get("entity_type") != "material":
+                continue
+            for alias_text in cls._iter_material_alias_texts(row):
+                key = cls._normalize_material_alias_key(alias_text)
+                if key:
+                    keys.add(key)
+        return sorted(keys)
+
+    def _load_existing_material_alias_map(self, cur, schema: str, alias_keys: list[str]) -> dict[str, str]:
+        if not alias_keys:
+            return {}
+        cur.execute(
+            f"""
+            SELECT alias_key, canonical_id
+            FROM {schema}.material_alias
+            WHERE alias_key = ANY(%s)
+            """,
+            (alias_keys,),
+        )
+        out: dict[str, str] = {}
+        for alias_key, canonical_id in cur.fetchall():
+            if not alias_key or not canonical_id:
+                continue
+            out[str(alias_key)] = str(canonical_id)
+        return out
+
+    @classmethod
+    def _prepare_material_registry_rows(
+        cls,
+        doc_id: str,
+        entity_rows: list[dict],
+        existing_alias_map: dict[str, str] | None = None,
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """准备跨文档 material registry 的批量 upsert 数据。
+
+        返回：
+        - canonical_rows: material_canonical 表行
+        - alias_rows: material_alias 表行
+        - usage_rows: material_doc_usage 表行
+        """
+        existing_alias_map = existing_alias_map or {}
+        canonical_rows_map: dict[str, dict] = {}
+        alias_rows_map: dict[str, dict] = {}
+        usage_counts: dict[str, int] = defaultdict(int)
+        usage_aliases: dict[str, set[str]] = defaultdict(set)
+
+        for row in entity_rows:
+            if row.get("entity_type") != "material":
+                continue
+
+            alias_texts = cls._iter_material_alias_texts(row)
+            alias_pairs: list[tuple[str, str]] = []
+            for alias_text in alias_texts:
+                alias_key = cls._normalize_material_alias_key(alias_text)
+                if alias_key:
+                    alias_pairs.append((alias_text, alias_key))
+            alias_keys = [alias_key for _, alias_key in alias_pairs]
+
+            canonical_id = row.get("canonical_id")
+            if not canonical_id or canonical_id == "PENDING_MAPPING":
+                seed_text = alias_texts[0] if alias_texts else row.get("entity_id")
+                canonical_id = cls._fallback_material_canonical_id(str(seed_text or ""))
+
+            # 先使用已存在的 alias->canonical 映射，保证跨文档稳定映射。
+            mapped_from_existing = None
+            for alias_key in alias_keys:
+                mapped = existing_alias_map.get(alias_key)
+                if mapped:
+                    mapped_from_existing = mapped
+                    break
+            if mapped_from_existing:
+                canonical_id = mapped_from_existing
+
+            canonical_id = str(canonical_id)
+            row["canonical_id"] = canonical_id
+
+            canonical_key = ""
+            if canonical_id.startswith("mat:"):
+                canonical_key = canonical_id.split(":", 1)[1]
+            if not canonical_key:
+                canonical_key = cls._normalize_material_alias_key(alias_texts[0] if alias_texts else canonical_id)
+
+            preferred_name = alias_texts[0] if alias_texts else canonical_id
+            existing_canonical = canonical_rows_map.get(canonical_id)
+            if existing_canonical:
+                old_name = existing_canonical.get("preferred_name") or ""
+                if old_name and preferred_name:
+                    if len(preferred_name) < len(old_name):
+                        existing_canonical["preferred_name"] = preferred_name
+                elif preferred_name:
+                    existing_canonical["preferred_name"] = preferred_name
+            else:
+                canonical_rows_map[canonical_id] = {
+                    "canonical_id": canonical_id,
+                    "canonical_key": canonical_key,
+                    "preferred_name": preferred_name,
+                    "doc_id": doc_id,
+                }
+
+            usage_counts[canonical_id] += 1
+            usage_aliases[canonical_id].update(alias_keys)
+
+            for alias_text, alias_key in alias_pairs:
+                existing_alias = alias_rows_map.get(alias_key)
+                if existing_alias:
+                    # 同一文档内同 alias 冲突时优先沿用已有映射，避免抖动。
+                    if existing_alias["canonical_id"] != canonical_id:
+                        continue
+                    if alias_text and len(alias_text) > len(existing_alias["alias_text"]):
+                        existing_alias["alias_text"] = alias_text
+                    continue
+                alias_rows_map[alias_key] = {
+                    "alias_key": alias_key,
+                    "alias_text": alias_text,
+                    "canonical_id": canonical_id,
+                    "doc_id": doc_id,
+                }
+
+        usage_rows = [
+            {
+                "doc_id": doc_id,
+                "canonical_id": canonical_id,
+                "mention_count": mention_count,
+                "alias_keys": sorted(usage_aliases.get(canonical_id) or set()),
+            }
+            for canonical_id, mention_count in usage_counts.items()
+        ]
+
+        return (
+            list(canonical_rows_map.values()),
+            list(alias_rows_map.values()),
+            usage_rows,
+        )
+
+    def _upsert_material_registry(self, cur, schema: str, doc_id: str, entity_rows: list[dict]) -> None:
+        alias_keys = self._collect_material_alias_keys(entity_rows)
+        existing_alias_map = self._load_existing_material_alias_map(cur, schema, alias_keys)
+        canonical_rows, alias_rows, usage_rows = self._prepare_material_registry_rows(
+            doc_id=doc_id,
+            entity_rows=entity_rows,
+            existing_alias_map=existing_alias_map,
+        )
+
+        # 幂等：先删除该文档旧 usage，再插入新 usage。
+        cur.execute(f"DELETE FROM {schema}.material_doc_usage WHERE doc_id = %s", (doc_id,))
+
+        if canonical_rows:
+            cur.executemany(
+                f"""
+                INSERT INTO {schema}.material_canonical(
+                    canonical_id, canonical_key, preferred_name,
+                    first_seen_doc_id, last_seen_doc_id, updated_at
+                ) VALUES (
+                    %(canonical_id)s, %(canonical_key)s, %(preferred_name)s,
+                    %(doc_id)s, %(doc_id)s, NOW()
+                )
+                ON CONFLICT (canonical_id) DO UPDATE SET
+                    canonical_key = COALESCE(EXCLUDED.canonical_key, {schema}.material_canonical.canonical_key),
+                    preferred_name = COALESCE(EXCLUDED.preferred_name, {schema}.material_canonical.preferred_name),
+                    last_seen_doc_id = EXCLUDED.last_seen_doc_id,
+                    updated_at = NOW();
+                """,
+                canonical_rows,
+            )
+
+        if alias_rows:
+            cur.executemany(
+                f"""
+                INSERT INTO {schema}.material_alias(
+                    alias_key, alias_text, canonical_id,
+                    first_seen_doc_id, last_seen_doc_id, updated_at, source
+                ) VALUES (
+                    %(alias_key)s, %(alias_text)s, %(canonical_id)s,
+                    %(doc_id)s, %(doc_id)s, NOW(), 'entity_mention'
+                )
+                ON CONFLICT (alias_key) DO UPDATE SET
+                    alias_text = EXCLUDED.alias_text,
+                    last_seen_doc_id = EXCLUDED.last_seen_doc_id,
+                    updated_at = NOW();
+                """,
+                alias_rows,
+            )
+
+        if usage_rows:
+            cur.executemany(
+                f"""
+                INSERT INTO {schema}.material_doc_usage(
+                    doc_id, canonical_id, mention_count, alias_keys
+                ) VALUES (
+                    %(doc_id)s, %(canonical_id)s, %(mention_count)s, %(alias_keys)s
+                )
+                ON CONFLICT (doc_id, canonical_id) DO UPDATE SET
+                    mention_count = EXCLUDED.mention_count,
+                    alias_keys = EXCLUDED.alias_keys;
+                """,
+                usage_rows,
+            )
 
     def init_schema(self) -> None:
         schema = self.config.schema
@@ -130,6 +368,39 @@ class PostgresPatentStore:
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS {schema}.material_canonical (
+            canonical_id TEXT PRIMARY KEY,
+            canonical_key TEXT,
+            preferred_name TEXT,
+            first_seen_doc_id TEXT REFERENCES {schema}.document(doc_id) ON DELETE SET NULL,
+            last_seen_doc_id TEXT REFERENCES {schema}.document(doc_id) ON DELETE SET NULL,
+            source TEXT NOT NULL DEFAULT 'heuristic',
+            metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS {schema}.material_alias (
+            alias_key TEXT PRIMARY KEY,
+            alias_text TEXT NOT NULL,
+            canonical_id TEXT NOT NULL REFERENCES {schema}.material_canonical(canonical_id) ON DELETE CASCADE,
+            first_seen_doc_id TEXT REFERENCES {schema}.document(doc_id) ON DELETE SET NULL,
+            last_seen_doc_id TEXT REFERENCES {schema}.document(doc_id) ON DELETE SET NULL,
+            source TEXT NOT NULL DEFAULT 'heuristic',
+            metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS {schema}.material_doc_usage (
+            doc_id TEXT NOT NULL REFERENCES {schema}.document(doc_id) ON DELETE CASCADE,
+            canonical_id TEXT NOT NULL REFERENCES {schema}.material_canonical(canonical_id) ON DELETE CASCADE,
+            mention_count INT NOT NULL DEFAULT 0,
+            alias_keys TEXT[] NOT NULL DEFAULT '{{}}',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (doc_id, canonical_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_document_publication ON {schema}.document(publication_number);
         CREATE INDEX IF NOT EXISTS idx_document_title_tsv ON {schema}.document USING GIN (to_tsvector('simple', coalesce(title, '')));
         CREATE INDEX IF NOT EXISTS idx_block_doc ON {schema}.block(doc_id);
@@ -142,6 +413,10 @@ class PostgresPatentStore:
         CREATE INDEX IF NOT EXISTS idx_experiment_example ON {schema}.experiment(example_id);
         CREATE INDEX IF NOT EXISTS idx_molecule_doc ON {schema}.molecule(doc_id);
         CREATE INDEX IF NOT EXISTS idx_molecule_mol ON {schema}.molecule USING GIST(mol);
+        CREATE INDEX IF NOT EXISTS idx_material_canonical_key ON {schema}.material_canonical(canonical_key);
+        CREATE INDEX IF NOT EXISTS idx_material_alias_canonical ON {schema}.material_alias(canonical_id);
+        CREATE INDEX IF NOT EXISTS idx_material_usage_doc ON {schema}.material_doc_usage(doc_id);
+        CREATE INDEX IF NOT EXISTS idx_material_usage_canonical ON {schema}.material_doc_usage(canonical_id);
         """
 
         with self._connect() as conn, conn.cursor() as cur:
@@ -309,6 +584,7 @@ class PostgresPatentStore:
             cur.execute(f"DELETE FROM {schema}.entity WHERE doc_id = %s", (doc.doc_id,))
             cur.execute(f"DELETE FROM {schema}.block WHERE doc_id = %s", (doc.doc_id,))
             cur.execute(f"DELETE FROM {schema}.molecule WHERE doc_id = %s", (doc.doc_id,))
+            cur.execute(f"DELETE FROM {schema}.material_doc_usage WHERE doc_id = %s", (doc.doc_id,))
 
             block_rows: list[dict] = []
             entity_rows: list[dict] = []
@@ -394,6 +670,10 @@ class PostgresPatentStore:
                         "raw": json.dumps(experiment.raw, ensure_ascii=False),
                     }
                 )
+
+            if entity_rows:
+                # 先对齐历史 alias 映射并写入 registry，再插入实体，确保 canonical_id 跨文档稳定。
+                self._upsert_material_registry(cur, schema, doc.doc_id, entity_rows)
 
             if block_rows:
                 cur.executemany(
@@ -622,7 +902,7 @@ class PostgresPatentStore:
     @staticmethod
     def _extract_smiles(entity) -> str | None:
         # 约定：优先显式前缀，其次尝试把可能是 SMILES 的短串作为候选。
-        # 注意：postprocess 默认 material.canonical_id=PENDING_MAPPING，
+        # 注意：canonical_id 可能是 registry id（如 mat:CBP / mat:RAW...），
         # 因此不能只看 canonical_id。
         candidates: list[str] = []
         if entity.canonical_id and isinstance(entity.canonical_id, str):
@@ -741,6 +1021,62 @@ class PostgresPatentStore:
             )
             conn.commit()
 
+    def cleanup_material_registry_orphans(self) -> None:
+        """离线维护：删除不再被任何文档使用的 canonical 节点。"""
+        schema = self.config.schema
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                DELETE FROM {schema}.material_canonical mc
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {schema}.material_doc_usage u WHERE u.canonical_id = mc.canonical_id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM {schema}.material_alias a WHERE a.canonical_id = mc.canonical_id
+                );
+                """
+            )
+            conn.commit()
+
+    def rebuild_material_registry(self) -> dict:
+        """从 entity(material) 全量重建跨文档 material registry。"""
+        schema = self.config.schema
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT doc_id, entity_id, value_text, normalized, canonical_id
+                FROM {schema}.entity
+                WHERE entity_type = 'material'
+                ORDER BY doc_id, entity_id
+                """
+            )
+            rows = cur.fetchall()
+
+            cur.execute(f"DELETE FROM {schema}.material_doc_usage;")
+            cur.execute(f"DELETE FROM {schema}.material_alias;")
+            cur.execute(f"DELETE FROM {schema}.material_canonical;")
+
+            grouped: dict[str, list[dict]] = defaultdict(list)
+            for doc_id, entity_id, value_text, normalized, canonical_id in rows:
+                grouped[str(doc_id)].append(
+                    {
+                        "entity_id": str(entity_id),
+                        "entity_type": "material",
+                        "value_text": value_text,
+                        "normalized": normalized,
+                        "canonical_id": canonical_id,
+                    }
+                )
+
+            for doc_id, entity_rows in grouped.items():
+                self._upsert_material_registry(cur, schema, doc_id, entity_rows)
+
+            conn.commit()
+            return {
+                "documents": len(grouped),
+                "material_entities": len(rows),
+            }
+
     def rdkit_substructure_search(self, smarts: str, limit: int = 20) -> list[dict]:
         schema = self.config.schema
         with self._connect() as conn, conn.cursor() as cur:
@@ -795,6 +1131,11 @@ class PostgresPatentStore:
                 doc_count = 0
             experiment_pk_cols: list[str] = []
             migration_needed = False
+            registry = {
+                "canonical_count": 0,
+                "alias_count": 0,
+                "doc_usage_count": 0,
+            }
             try:
                 cur.execute(
                     """
@@ -817,6 +1158,15 @@ class PostgresPatentStore:
                 migration_needed = experiment_pk_cols != ["experiment_id"]
             except Exception:
                 migration_needed = True
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {schema}.material_canonical")
+                registry["canonical_count"] = int(cur.fetchone()[0])
+                cur.execute(f"SELECT COUNT(*) FROM {schema}.material_alias")
+                registry["alias_count"] = int(cur.fetchone()[0])
+                cur.execute(f"SELECT COUNT(*) FROM {schema}.material_doc_usage")
+                registry["doc_usage_count"] = int(cur.fetchone()[0])
+            except Exception:
+                pass
         return {
             "ok": True,
             "schema": schema,
@@ -824,4 +1174,5 @@ class PostgresPatentStore:
             "document_count": doc_count,
             "experiment_pk_columns": experiment_pk_cols,
             "experiment_pk_migration_needed": migration_needed,
+            "material_registry": registry,
         }

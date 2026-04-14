@@ -37,6 +37,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--ingest-pg", action="store_true", help="导入 PostgreSQL 关系层")
     ap.add_argument("--sync-age", action="store_true", help="导入 PG 时同步 AGE 图")
     ap.add_argument("--age-clean-orphans", action="store_true", help="离线清理 AGE 图孤儿节点")
+    ap.add_argument("--rebuild-material-registry", action="store_true", help="从 entity(material) 全量重建跨文档 material registry")
+    ap.add_argument("--material-clean-orphans", action="store_true", help="清理不再被文档使用的 material canonical 节点")
 
     ap.add_argument("--init-os", action="store_true", help="初始化 OpenSearch 索引")
     ap.add_argument("--index-os", action="store_true", help="写入 OpenSearch 索引")
@@ -84,6 +86,8 @@ def main() -> int:
             args.migrate_experiment_pk,
             args.ingest_pg,
             args.age_clean_orphans,
+            args.rebuild_material_registry,
+            args.material_clean_orphans,
             args.init_os,
             args.index_os,
             args.search_doc,
@@ -106,6 +110,8 @@ def main() -> int:
         or args.migrate_experiment_pk
         or args.ingest_pg
         or args.age_clean_orphans
+        or args.rebuild_material_registry
+        or args.material_clean_orphans
         or args.rdkit_substruct
         or args.rdkit_sim
         or args.healthcheck
@@ -162,10 +168,16 @@ def main() -> int:
                 total_relations += len(block.relations)
                 for entity in block.entities:
                     for field in (entity.canonical_id, entity.value, entity.normalized):
-                        if isinstance(field, str) and field and field != "PENDING_MAPPING":
-                            if field.startswith("SMILES:") or (" " not in field and any(ch.isalpha() for ch in field)):
-                                candidate_smiles += 1
-                                break
+                        if not isinstance(field, str):
+                            continue
+                        field = field.strip()
+                        if not field:
+                            continue
+                        if field == "PENDING_MAPPING" or field.startswith("mat:"):
+                            continue
+                        if field.startswith("SMILES:") or (" " not in field and any(ch.isalpha() for ch in field)):
+                            candidate_smiles += 1
+                            break
         print(
             json.dumps(
                 {
@@ -202,6 +214,20 @@ def main() -> int:
         assert pg_store is not None
         pg_store.cleanup_age_orphans()
         logger.info("AGE 孤儿节点清理完成")
+
+    if args.rebuild_material_registry:
+        assert pg_store is not None
+        result = pg_store.rebuild_material_registry()
+        logger.info(
+            "material registry 重建完成: docs=%d material_entities=%d",
+            result.get("documents", 0),
+            result.get("material_entities", 0),
+        )
+
+    if args.material_clean_orphans:
+        assert pg_store is not None
+        pg_store.cleanup_material_registry_orphans()
+        logger.info("material registry 孤儿 canonical 清理完成")
 
     if args.init_os:
         assert os_index is not None

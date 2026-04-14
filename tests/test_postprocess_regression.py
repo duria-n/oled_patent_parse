@@ -1,6 +1,7 @@
 import unittest
 
 from patent_parser.postprocess import (
+    _assign_material_canonical_ids,
     _bind_material_roles,
     _collect_table_entities_relations,
     _extract_entities,
@@ -58,6 +59,32 @@ class PostprocessRegressionTests(unittest.TestCase):
         material_entities = [e for e in entities if e.get("type") == "material"]
         self.assertTrue(material_entities)
         self.assertEqual(material_entities[0].get("canonical_id"), "mat:CBP")
+
+    def test_extract_bracket_material_name(self):
+        text = "Ir(ppy)3 was used as emitter in EML."
+        entities = _extract_entities(text)
+        mats = [e for e in entities if e.get("type") == "material" and e.get("value") == "Ir(ppy)3"]
+        self.assertTrue(mats)
+        _assign_material_canonical_ids(entities, {})
+        self.assertTrue(mats[0].get("canonical_id", "").startswith("mat:"))
+        self.assertNotEqual(mats[0].get("canonical_id"), "PENDING_MAPPING")
+
+    def test_chunk_role_binding_avoids_cross_binding(self):
+        text = "CBP host, NPB dopant."
+        entities = _extract_entities(text)
+        for i, ent in enumerate(entities, 1):
+            ent["entity_id"] = f"e{i:03d}"
+        rels = _bind_material_roles(text, entities, base_id="b002")
+        rule_set = {r.get("rule") for r in rels}
+        self.assertIn("chunk_role_binding", rule_set)
+        by_id = {e["entity_id"]: e for e in entities}
+        pairs = {
+            (by_id[r["source_entity_id"]]["value"], by_id[r["target_entity_id"]]["value"])
+            for r in rels
+            if r.get("type") == "has_role"
+        }
+        self.assertIn(("CBP", "host"), pairs)
+        self.assertIn(("NPB", "dopant"), pairs)
 
 
 if __name__ == "__main__":

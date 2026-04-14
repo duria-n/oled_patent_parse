@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -190,6 +191,7 @@ CONFIDENCE_SCORES = {
     "metric_unit_match": 0.85,
     "nearest_metric": 0.65,
     "nearest_role": 0.70,
+    "chunk_role_binding": 0.82,
     "pattern_material_as_role": 0.93,
     "pattern_role_material": 0.92,
     "pattern_material_in_layer": 0.9,
@@ -252,6 +254,8 @@ _MATERIAL_RE = re.compile(
     r"|(?:[A-Z]{2,}[A-Za-z]*\d+)"  # 大写缩写混合数字
     r"|(?:[A-Z][A-Za-z]{1,}\d+)"   # 可能的材料缩写 + 数字
     r"|(?:[A-Z]{2,}[A-Za-z0-9\-]{1,})"  # NPB, CBP 等
+    r"|(?:[A-Z][A-Za-z]{0,8}(?:\([A-Za-z0-9+\-]{1,24}\)){1,3}\d{0,3})"  # Ir(ppy)3 / Ir(dfppy)2(pic)
+    r"|(?:[a-z][A-Z][A-Za-z0-9\-]{1,24})"  # mCP / mCBP 等小写前缀缩写
     r")\b"
 )
 _MATERIAL_STOP = {"FIG", "TABLE", "EXAMPLE", "OLED", "PCT", "WO", "US", "EP"}
@@ -274,6 +278,28 @@ _EXAMPLE_ID_PATTERNS = [
     ),
 ]
 _MAT_CANON_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
+_MAT_ALIAS_LEXICON = {
+    "4,4'-bis(carbazol-9-yl)biphenyl": "CBP",
+    "4,4-bis(carbazol-9-yl)biphenyl": "CBP",
+    "N,N'-di(1-naphthyl)-N,N'-diphenylbenzidine": "NPB",
+    "2,2',2''-(1,3,5-benzinetriyl)-tris(1-phenyl-1-h-benzimidazole)": "TPBi",
+    "4,7-diphenyl-1,10-phenanthroline": "BPhen",
+    "tris(2-phenylpyridine)iridium": "Ir(ppy)3",
+    "fac-Ir(ppy)3": "Ir(ppy)3",
+    "CBP": "CBP",
+    "NPB": "NPB",
+    "TPBi": "TPBi",
+    "BPhen": "BPhen",
+    "Ir(ppy)3": "Ir(ppy)3",
+    "mCP": "mCP",
+    "TCTA": "TCTA",
+}
+_MAT_ALIAS_KEY_MAP: dict[str, str] = {}
+for _alias, _canonical in _MAT_ALIAS_LEXICON.items():
+    _alias_key = _MAT_CANON_KEY_RE.sub("", _alias).upper()
+    _canonical_key = _MAT_CANON_KEY_RE.sub("", _canonical).upper()
+    if _alias_key and _canonical_key:
+        _MAT_ALIAS_KEY_MAP[_alias_key] = _canonical_key
 _MAT_ALIAS_PAIR_PATTERNS = [
     re.compile(
         r"\b([A-Za-z][A-Za-z0-9/\-]*(?:\s+[A-Za-z0-9/\-]+){0,5})\s*\(\s*([A-Z][A-Z0-9\-]{1,20})\s*\)"
@@ -287,9 +313,10 @@ _ROW_KEY_COL_HINT_RE = re.compile(
     r"材料|化合物|样品|名称|结构|器件",
     re.I,
 )
-_ROLE_PREFIX_ONLY_RE = re.compile(r"^\s*(?:material|compound|is|was|:|：|=|-|,|\(|\)|\.)*\s*$", re.I)
+_ROLE_PREFIX_ONLY_RE = re.compile(r"^\s*(?:material|compound|is|was|:|：|=|-|\(|\)|\.)*\s*$", re.I)
 _ROLE_AS_CUE_RE = re.compile(r"\b(?:was\s+used\s+as|used\s+as|served\s+as|acts?\s+as|as)\b", re.I)
 _IN_LAYER_CUE_RE = re.compile(r"\bin\b", re.I)
+_ROLE_CHUNK_SPLIT_RE = re.compile(r"[,，]\s*|\b(?:and|or|with)\b|以及|并且", re.I)
 
 
 class _SimpleHTMLTableParser(HTMLParser):
@@ -585,6 +612,23 @@ def _normalize_material_key(token: str) -> str:
     return _MAT_CANON_KEY_RE.sub("", token or "").upper()
 
 
+def _material_canonical_id_from_key(key: str) -> str:
+    return f"mat:{key}"
+
+
+def _fallback_material_canonical_id(token: str) -> str:
+    raw = (token or "").strip().lower()
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12].upper() if raw else "0" * 12
+    return f"mat:RAW{digest}"
+
+
+def _seed_material_alias_map(alias_map: dict[str, str]) -> None:
+    for alias_key, canonical_key in _MAT_ALIAS_KEY_MAP.items():
+        canonical_id = _material_canonical_id_from_key(canonical_key)
+        alias_map.setdefault(canonical_key, canonical_id)
+        alias_map.setdefault(alias_key, canonical_id)
+
+
 def _looks_like_material_abbr(token: str) -> bool:
     t = token.strip()
     return bool(re.fullmatch(r"[A-Z][A-Z0-9\-]{1,20}", t))
@@ -617,10 +661,14 @@ def _update_material_alias_map(text: str, alias_map: dict[str, str]) -> None:
     for alias, canonical in _extract_material_alias_pairs(text):
         alias_key = _normalize_material_key(alias)
         canonical_key = _normalize_material_key(canonical)
+        if canonical_key:
+            canonical_key = _MAT_ALIAS_KEY_MAP.get(canonical_key, canonical_key)
+        if alias_key:
+            alias_key = _MAT_ALIAS_KEY_MAP.get(alias_key, alias_key)
         if not alias_key or not canonical_key:
             continue
         existing = alias_map.get(alias_key) or alias_map.get(canonical_key)
-        canonical_id = existing or f"mat:{canonical_key}"
+        canonical_id = existing or _material_canonical_id_from_key(canonical_key)
         alias_map[canonical_key] = canonical_id
         alias_map[alias_key] = canonical_id
 
@@ -629,13 +677,19 @@ def _assign_material_canonical_ids(entities: list[dict], alias_map: dict[str, st
     for ent in entities:
         if ent.get("type") != "material":
             continue
-        key = _normalize_material_key(str(ent.get("value") or ""))
+        raw_value = str(ent.get("value") or "")
+        key = _normalize_material_key(raw_value)
         if not key:
-            ent["canonical_id"] = "PENDING_MAPPING"
+            ent["canonical_id"] = _fallback_material_canonical_id(raw_value)
             continue
-        canonical_id = alias_map.get(key)
+        mapped_key = _MAT_ALIAS_KEY_MAP.get(key, key)
+        canonical_id = alias_map.get(key) or alias_map.get(mapped_key)
         if not canonical_id:
-            canonical_id = f"mat:{key}"
+            canonical_id = _material_canonical_id_from_key(mapped_key)
+            alias_map[mapped_key] = canonical_id
+            alias_map[key] = canonical_id
+        else:
+            alias_map[mapped_key] = canonical_id
             alias_map[key] = canonical_id
         ent["canonical_id"] = canonical_id
 
@@ -723,6 +777,23 @@ def _bind_metric_values(
                 "sentence_id": sent_id,
             })
     return relations
+
+
+def _split_role_chunks(text: str, sent: tuple[int, int]) -> list[tuple[int, int]]:
+    start, end = sent
+    if start >= end:
+        return []
+    chunks: list[tuple[int, int]] = []
+    cursor = start
+    for m in _ROLE_CHUNK_SPLIT_RE.finditer(text[start:end]):
+        cut_start = start + m.start()
+        cut_end = start + m.end()
+        if cut_start > cursor:
+            chunks.append((cursor, cut_start))
+        cursor = max(cursor, cut_end)
+    if cursor < end:
+        chunks.append((cursor, end))
+    return chunks or [sent]
 
 
 def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[dict]:
@@ -841,43 +912,76 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                 "sentence_id": f"{base_id}_s{sid:03d}",
             })
 
+    # clause/chunk 优先：例如 "CBP host, NPB dopant"
+    bound_role_ids = set(pattern_bound_role_ids)
     for sid, sent in enumerate(sentence_bounds):
         sent_mats = [m for m in materials if _in_sent(m["span"], sent)]
         sent_roles = [r for r in roles if _in_sent(r["span"], sent)]
         if not sent_mats or not sent_roles:
             continue
+        for chunk in _split_role_chunks(text, sent):
+            chunk_mats = [m for m in sent_mats if _in_sent(m["span"], chunk)]
+            if len(chunk_mats) != 1:
+                continue
+            mat = chunk_mats[0]
+            mat_id = mat.get("entity_id")
+            mat_span = mat.get("span")
+            if not mat_id or not isinstance(mat_span, list):
+                continue
+            chunk_roles = [
+                r for r in sent_roles
+                if _in_sent(r["span"], chunk) and r.get("entity_id") not in bound_role_ids
+            ]
+            for role in chunk_roles:
+                role_id = role.get("entity_id")
+                role_span = role.get("span")
+                if not role_id or not isinstance(role_span, list):
+                    continue
+                pair_key = (mat_id, role_id, "has_role")
+                if pair_key in bound_pairs:
+                    continue
+                bound_pairs.add(pair_key)
+                bound_role_ids.add(role_id)
+                relations.append({
+                    "type": "has_role",
+                    "source_entity_id": mat_id,
+                    "target_entity_id": role_id,
+                    "confidence": CONFIDENCE_SCORES["chunk_role_binding"],
+                    "rule": "chunk_role_binding",
+                    "distance": abs(role_span[0] - mat_span[0]),
+                    "sentence_id": f"{base_id}_s{sid:03d}",
+                })
+
+    # 兜底最近邻：仅在句内只有一个 material 时启用，避免多材料句错绑
+    for sid, sent in enumerate(sentence_bounds):
+        sent_mats = [m for m in materials if _in_sent(m["span"], sent)]
+        sent_roles = [r for r in roles if _in_sent(r["span"], sent)]
+        if len(sent_mats) != 1 or not sent_roles:
+            continue
+        best = sent_mats[0]
+        src_id = best.get("entity_id")
+        mspan = best.get("span")
+        if not src_id or not isinstance(mspan, list):
+            continue
         for role in sent_roles:
             role_id = role.get("entity_id")
-            if not role_id:
+            role_span = role.get("span")
+            if not role_id or not isinstance(role_span, list):
                 continue
-            if role_id in pattern_bound_role_ids:
+            if role_id in bound_role_ids:
                 continue
-            rpos = role["span"][0]
-            best = None
-            best_dist = None
-            for mat in sent_mats:
-                mpos = mat["span"][0]
-                dist = abs(rpos - mpos)
-                if best_dist is None or dist < best_dist:
-                    best = mat
-                    best_dist = dist
-            if not best:
-                continue
-            src_id = best.get("entity_id")
-            tgt_id = role.get("entity_id")
-            if not src_id or not tgt_id:
-                continue
-            pair_key = (src_id, tgt_id, "has_role")
+            pair_key = (src_id, role_id, "has_role")
             if pair_key in bound_pairs:
                 continue
             bound_pairs.add(pair_key)
+            bound_role_ids.add(role_id)
             relations.append({
                 "type": "has_role",
                 "source_entity_id": src_id,
-                "target_entity_id": tgt_id,
+                "target_entity_id": role_id,
                 "confidence": CONFIDENCE_SCORES["nearest_role"],
                 "rule": "nearest_role",
-                "distance": int(best_dist or 0),
+                "distance": abs(role_span[0] - mspan[0]),
                 "sentence_id": f"{base_id}_s{sid:03d}",
             })
     return relations
@@ -1038,13 +1142,17 @@ def _detect_material_col(headers: dict[int, str]) -> int:
 def _promote_row_material_canonical(material_alias_map: dict[str, str], row_key_text: str) -> str:
     key = _normalize_material_key(row_key_text)
     if not key:
-        return "PENDING_MAPPING"
-    canonical_id = f"mat:{key}"
+        return _fallback_material_canonical_id(row_key_text)
+    mapped_key = _MAT_ALIAS_KEY_MAP.get(key, key)
+    canonical_id = _material_canonical_id_from_key(mapped_key)
     old = material_alias_map.get(key)
+    if not old:
+        old = material_alias_map.get(mapped_key)
     if old and old != canonical_id:
         for alias, mapped in list(material_alias_map.items()):
             if mapped == old:
                 material_alias_map[alias] = canonical_id
+    material_alias_map[mapped_key] = canonical_id
     material_alias_map[key] = canonical_id
     return canonical_id
 
@@ -1458,6 +1566,7 @@ def build_structured_json(
     context = {"section": None, "subsection": None, "example_id": None}
     reference_numerals: dict[str, str] = {}
     material_alias_map: dict[str, str] = {}
+    _seed_material_alias_map(material_alias_map)
 
     for idx, item in enumerate(content_list):
         btype = item.get("type")

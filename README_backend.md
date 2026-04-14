@@ -2,7 +2,7 @@
 
 本仓库新增了 `patent_backend/` 与 `backend_pipeline.py`，用于把 `*_structured.json` 导入并提供四类能力：
 
-- PostgreSQL：关系化主数据（doc/block/entity/relation/experiment）
+- PostgreSQL：关系化主数据（doc/block/entity/relation/experiment）+ material canonical registry
 - RDKit cartridge：结构化学检索（子结构、相似度）
 - Apache AGE：在 PostgreSQL 上直接进行图查询（openCypher + SQL）
 - OpenSearch：关键词 + 语义向量混合检索（hybrid search）
@@ -52,6 +52,12 @@ python backend_pipeline.py --ingest-pg --sync-age --inputs md output
 # （建议定期离线执行）清理 AGE 图孤儿节点
 python backend_pipeline.py --age-clean-orphans
 
+# （可选）从已有 entity(material) 全量重建跨文档 material registry
+python backend_pipeline.py --rebuild-material-registry
+
+# （可选）清理不再被文档使用的 material canonical 节点
+python backend_pipeline.py --material-clean-orphans
+
 # 初始化 OpenSearch 索引（默认 embedder=auto：有 OPENAI_API_KEY 就用 OpenAI，否则回退 hash）
 python backend_pipeline.py --init-os --embedder auto --embed-dim 384
 
@@ -99,7 +105,11 @@ $$) AS (doc_id agtype, block_id agtype, entity_id agtype, value_text agtype);
 
 - `SMILES` 的入库规则：
   - 优先 `entity.canonical_id` / `entity.value` / `entity.normalized` 的 `SMILES:...` 前缀
-  - 若无前缀，使用保守启发式识别潜在 SMILES（自动过滤 `PENDING_MAPPING` 等占位值）
+  - 若无前缀，使用保守启发式识别潜在 SMILES（自动过滤 `mat:*` registry id 等非结构字段）
+- 新增 material registry（三张表）：
+  - `material_canonical`：canonical 节点主表
+  - `material_alias`：alias -> canonical 映射
+  - `material_doc_usage`：每篇文档对 canonical 的使用统计（幂等重跑友好）
 - 如需更高质量语义检索，建议使用：
   - `--embedder openai --openai-embed-model text-embedding-3-small`
 - 当前实现采用“文档级幂等 upsert + 明细重建”，适合离线批处理与增量重跑。
