@@ -44,6 +44,14 @@ class PostprocessRegressionTests(unittest.TestCase):
         self.assertIn("pattern_material_as_role", rules)
         self.assertIn("pattern_material_in_layer", rules)
 
+    def test_expanded_role_keywords_match(self):
+        text = "CBP was used as guest material in HIL."
+        entities = _extract_entities(text)
+        role_values = {str(e.get("value")) for e in entities if e.get("type") == "role"}
+        layer_values = {str(e.get("value")) for e in entities if e.get("type") == "device_layer"}
+        self.assertIn("guest material", role_values)
+        self.assertIn("hil", layer_values)
+
     def test_table_col_row_cell_binding(self):
         rows = [
             [

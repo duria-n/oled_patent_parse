@@ -42,6 +42,12 @@ class BiblioMetadataProvider:
     def _normalize_key(key: str) -> str:
         return re.sub(r"[^A-Za-z0-9]", "", key or "").upper()
 
+    @staticmethod
+    def _normalize_pub_key(key: str) -> str:
+        s = (key or "").strip().upper()
+        s = re.sub(r"[\s\-_/]", "", s)
+        return s
+
     def _build_normalized_cache(self, cache: dict[str, dict]) -> dict[str, dict]:
         normalized: dict[str, dict] = {}
         for raw_key, raw_value in cache.items():
@@ -56,6 +62,8 @@ class BiblioMetadataProvider:
         raw = self._cache.get(key)
         if not raw:
             raw = self._cache.get(key.upper()) or self._cache.get(key.lower())
+        if not raw:
+            raw = self._cache.get(self._normalize_pub_key(key))
         if not raw:
             raw = self._normalized_cache.get(self._normalize_key(key))
         if not isinstance(raw, dict):

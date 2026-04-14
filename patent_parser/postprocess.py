@@ -216,8 +216,17 @@ _LAYER_SYNONYMS = {
 }
 
 _ROLE_KEYWORDS = [
-    "host", "dopant", "emitter", "acceptor", "donor",
-    "hole transport", "electron transport", "injection",
+    "host", "host material",
+    "dopant", "guest", "guest material",
+    "emitter", "light-emitting material",
+    "acceptor", "donor",
+    "hole transport", "hole transporting", "htl",
+    "electron transport", "electron transporting", "etl",
+    "hole injection", "hil",
+    "electron injection", "eil",
+    "hole blocking", "hbl",
+    "exciton blocking", "ebl",
+    "injection",
 ]
 _ROLE_PATTERNS = []
 for _r in _ROLE_KEYWORDS:
@@ -306,7 +315,7 @@ _ROW_KEY_COL_HINT_RE = re.compile(
     re.I,
 )
 _ROLE_PREFIX_ONLY_RE = re.compile(r"^\s*(?:material|compound|is|was|:|：|=|-|\(|\)|\.)*\s*$", re.I)
-_ROLE_AS_CUE_RE = re.compile(r"\b(?:was\s+used\s+as|used\s+as|served\s+as|acts?\s+as|as)\b", re.I)
+_ROLE_AS_CUE_RE = re.compile(r"\b(?:was\s+used\s+as|used\s+as|served\s+as|functioned\s+as|acts?\s+as|as)\b", re.I)
 _IN_LAYER_CUE_RE = re.compile(r"\bin\b", re.I)
 _ROLE_CHUNK_SPLIT_RE = re.compile(r"[,，;；:：]\s*|\b(?:and|or|with|wherein)\b|以及|并且", re.I)
 
