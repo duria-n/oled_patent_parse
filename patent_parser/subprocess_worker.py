@@ -52,6 +52,10 @@ from pathlib import Path
 # 这部分在模块级执行，因为 MinerU 内部的 ProcessPoolExecutor 使用 spawn
 # 启动 worker 时会重新 import 本脚本——cap 必须在 worker 中也生效。
 def _cap_process_pool_executor():
+    # 可通过 MINERU_PATCH_PROCESS_POOL=0 显式关闭 monkey patch
+    patch_flag = os.environ.get("MINERU_PATCH_PROCESS_POOL", "1").strip().lower()
+    if patch_flag in {"0", "false", "off", "no"}:
+        return
     raw = os.environ.get("MINERU_PDF_RENDER_WORKERS", "").strip()
     try:
         cap = int(raw)
@@ -59,8 +63,15 @@ def _cap_process_pool_executor():
         cap = 0
     if cap <= 0:
         return
+    if sys.version_info < (3, 8):
+        return
     import concurrent.futures
     _OrigPPE = concurrent.futures.ProcessPoolExecutor
+    # 如果上游已经替换过实现，避免重复覆盖未知行为
+    if getattr(_OrigPPE, "__name__", "") == "_CappedPPE":
+        return
+    if not str(getattr(_OrigPPE, "__module__", "")).startswith("concurrent.futures"):
+        return
     class _CappedPPE(_OrigPPE):
         def __init__(self, max_workers=None, *a, **kw):
             if max_workers is None or max_workers > cap:
@@ -154,6 +165,7 @@ if __name__ == '__main__':
     env.setdefault("MINERU_INTRA_OP_NUM_THREADS", "1")
     env.setdefault("MINERU_INTER_OP_NUM_THREADS", "1")
     env["MINERU_PDF_RENDER_WORKERS"] = str(max(1, int(render_workers)))
+    env.setdefault("MINERU_PATCH_PROCESS_POOL", "1")
 
     # 本地模型目录：生成临时 magic-pdf.json 并通过环境变量注入子进程
     _tmp_config_path = None

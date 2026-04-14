@@ -69,8 +69,8 @@ class BasePDFParser(ABC):
         for entry in entries:
             if not entry.is_dir():
                 continue
-            # 顶层目录中的跳过目录（output/、md/ 等）整棵跳过
-            if is_root and entry.name in self._SKIP_DIRS:
+            # 生成目录（output/、md/ 等）在任意层级都跳过，避免递归进入中间产物
+            if entry.name in self._SKIP_DIRS:
                 logger.debug("跳过保留目录: %s", entry.name)
                 continue
                 

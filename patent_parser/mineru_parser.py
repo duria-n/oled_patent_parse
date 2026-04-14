@@ -14,6 +14,7 @@ from concurrent.futures import (
 )
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
+from queue import Empty
 
 from .base_parser import BasePDFParser
 from .config import add_file_logger, logger
@@ -109,7 +110,7 @@ def _get_gpu_count() -> int:
     return 0
 
 
-def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
+def _init_worker(gpu_queue, fallback_gpu_ids, log_path, worker_pid_queue=None):
     """Worker 初始化函数：绑定 GPU 并重建日志 handler。
 
     - 非阻塞地从 mp.Queue 拿一个 GPU 槽位，10 秒内取不到就退化为按 PID 取模，
@@ -119,6 +120,12 @@ def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
       下是行级原子的。
     """
     import os as _os
+
+    if worker_pid_queue is not None:
+        try:
+            worker_pid_queue.put(_os.getpid())
+        except Exception:
+            pass
 
     try:
         gpu_id = gpu_queue.get(timeout=10)
@@ -489,6 +496,8 @@ class MinerUPatentParser(BasePDFParser):
         ctx = multiprocessing.get_context("spawn")
 
         gpu_queue = ctx.Queue()
+        worker_pid_queue = ctx.Queue()
+        known_worker_pids: set[int] = set()
         # 超量装填，防止 executor 重启 worker 时 get() 拿不到槽位
         slots = max(self.workers, len(self.gpu_ids)) * 4
         for i in range(slots):
@@ -500,7 +509,7 @@ class MinerUPatentParser(BasePDFParser):
             max_workers=self.workers,
             mp_context=ctx,
             initializer=_init_worker,
-            initargs=(gpu_queue, tuple(self.gpu_ids), str(log_path) if log_path else None),
+            initargs=(gpu_queue, tuple(self.gpu_ids), str(log_path) if log_path else None, worker_pid_queue),
         )
 
         pending_queue: list = list(pending)
@@ -521,6 +530,19 @@ class MinerUPatentParser(BasePDFParser):
             if tqdm and use_tqdm and sys.stderr.isatty()
             else None
         )
+
+        def _drain_worker_pids() -> None:
+            while True:
+                try:
+                    pid = worker_pid_queue.get_nowait()
+                except Empty:
+                    break
+                except Exception:
+                    break
+                try:
+                    known_worker_pids.add(int(pid))
+                except Exception:
+                    continue
 
         def _submit(item):
             _, pdf_path, lang, is_scanned, _lang_source = item
@@ -568,8 +590,10 @@ class MinerUPatentParser(BasePDFParser):
 
         try:
             _fill_window()
+            _drain_worker_pids()
 
             while in_flight and not broken:
+                _drain_worker_pids()
                 # 检查协作式中断标志
                 if self._interrupt_event.is_set():
                     _interrupted = True
@@ -634,6 +658,7 @@ class MinerUPatentParser(BasePDFParser):
                     break
 
                 _fill_window()
+                _drain_worker_pids()
 
         except KeyboardInterrupt:
             _interrupted = True
@@ -665,11 +690,16 @@ class MinerUPatentParser(BasePDFParser):
             # 中断时强杀所有残余 worker 进程，防止子进程（含 MinerU 内部 spawn 的孙进程）
             # 在主进程退出后变成孤儿继续占用 GPU
             if cancel:
-                self._kill_worker_processes(executor)
+                self._kill_worker_processes(known_worker_pids)
 
             try:
                 gpu_queue.close()
                 gpu_queue.join_thread()
+            except Exception:
+                pass
+            try:
+                worker_pid_queue.close()
+                worker_pid_queue.join_thread()
             except Exception:
                 pass
 
@@ -678,7 +708,7 @@ class MinerUPatentParser(BasePDFParser):
         return unfinished if broken else []
 
     @staticmethod
-    def _kill_worker_processes(executor):
+    def _kill_worker_processes(worker_pids: set[int]):
         """强杀 ProcessPoolExecutor 管理的所有 worker 进程及其子进程树。
 
         executor.shutdown(wait=False) 只是不再等 worker 结束，但不会杀它们。
@@ -687,15 +717,7 @@ class MinerUPatentParser(BasePDFParser):
         """
         import signal as _signal
 
-        pids: list[int] = []
-        try:
-            # CPython 实现细节：_processes 是 {pid: Process} 的 dict
-            processes = getattr(executor, "_processes", None)
-            if processes:
-                pids = list(processes.keys())
-        except Exception:
-            pass
-
+        pids = sorted(int(p) for p in worker_pids if isinstance(p, int) or str(p).isdigit())
         for pid in pids:
             try:
                 os.kill(pid, _signal.SIGKILL)

@@ -41,10 +41,24 @@ def _is_scanned_pdf(pdf_path: Path) -> bool:
         lg.setLevel(logging.CRITICAL)
     try:
         reader = PdfReader(str(pdf_path))
+        total_pages = len(reader.pages)
+        if total_pages <= 0:
+            return True
+        sample_indexes = sorted(
+            {
+                0,
+                1,
+                2,
+                max(total_pages // 2, 0),
+                max(total_pages - 1, 0),
+            }
+        )
         text = ""
-        for page in reader.pages[:5]:
-            text += page.extract_text() or ""
-            if len(text) > 100:
+        for page_idx in sample_indexes:
+            if page_idx < 0 or page_idx >= total_pages:
+                continue
+            text += reader.pages[page_idx].extract_text() or ""
+            if len(text) > 120:
                 return False
         return len(text.strip()) == 0
     except Exception:

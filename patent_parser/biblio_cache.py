@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,7 @@ class BiblioMetadataProvider:
     def __init__(self, cache_path: str | Path | None):
         self.cache_path = Path(cache_path).resolve() if cache_path else None
         self._cache = self._load_cache()
+        self._normalized_cache = self._build_normalized_cache(self._cache)
 
     def _load_cache(self) -> dict[str, dict]:
         if not self.cache_path or not self.cache_path.exists():
@@ -36,10 +38,26 @@ class BiblioMetadataProvider:
         except (OSError, json.JSONDecodeError):
             return {}
 
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]", "", key or "").upper()
+
+    def _build_normalized_cache(self, cache: dict[str, dict]) -> dict[str, dict]:
+        normalized: dict[str, dict] = {}
+        for raw_key, raw_value in cache.items():
+            norm_key = self._normalize_key(str(raw_key))
+            if not norm_key or norm_key in normalized:
+                continue
+            if isinstance(raw_value, dict):
+                normalized[norm_key] = raw_value
+        return normalized
+
     def lookup(self, key: str) -> BiblioMetadata | None:
         raw = self._cache.get(key)
         if not raw:
             raw = self._cache.get(key.upper()) or self._cache.get(key.lower())
+        if not raw:
+            raw = self._normalized_cache.get(self._normalize_key(key))
         if not isinstance(raw, dict):
             return None
         meta = raw.get("metadata", raw)
