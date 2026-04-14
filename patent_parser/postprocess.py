@@ -131,7 +131,7 @@ if BaseModel:
 
 _FIG_RE = re.compile(r"\b(?:fig(?:ure)?|图)\s*\.?\s*(\d+[a-zA-Z]?)", re.I)
 _TABLE_RE = re.compile(r"\b(?:table|表)\s*\.?\s*(\d+[a-zA-Z]?)", re.I)
-_CLAIM_RE = re.compile(r"^\s*(\d+)\s*[\.\、:)]\s*(.+)$")
+_CLAIM_RE = re.compile(r"^\s*(?:claim\s*|claims?\s*|权利要求\s*)?(\d+)\s*(?:[\.\、:：)]|\b)\s*(.+)$", re.I)
 _CLAIM_LABEL_RE = re.compile(r"^\s*(?:claim|claims?|权利要求)\s*(\d+)\s*[\.\、:：)]?\s*(.+)$", re.I)
 _CLAIM_DEP_RE = re.compile(
     r"(?:claim|claims|权利要求)\s*"
@@ -247,17 +247,12 @@ _UNIT_RE = re.compile(
     re.I,
 )
 
-_MATERIAL_RE = re.compile(
-    r"\b("
-    r"(?:[A-Z][a-z]?\d+)+"  # 化学式，如 Alq3
-    r"|(?:[A-Z]{2,}\d+)"    # 大写缩写 + 数字，如 NPB1
-    r"|(?:[A-Z]{2,}[A-Za-z]*\d+)"  # 大写缩写混合数字
-    r"|(?:[A-Z][A-Za-z]{1,}\d+)"   # 可能的材料缩写 + 数字
-    r"|(?:[A-Z]{2,}[A-Za-z0-9\-]{1,})"  # NPB, CBP 等
-    r"|(?:[A-Z][A-Za-z]{0,8}(?:\([A-Za-z0-9+\-]{1,24}\)){1,3}\d{0,3})"  # Ir(ppy)3 / Ir(dfppy)2(pic)
-    r"|(?:[a-z][A-Z][A-Za-z0-9\-]{1,24})"  # mCP / mCBP 等小写前缀缩写
-    r")\b"
-)
+_MATERIAL_PATTERNS = [
+    re.compile(r"\b(?:[A-Z][a-z]?\d+)+\b"),  # Alq3
+    re.compile(r"\b(?:[A-Z]{2,}[A-Za-z0-9\-]{1,}|[a-z][A-Z][A-Za-z0-9\-]{1,24})\b"),  # CBP/TPBi/mCP
+    re.compile(r"\b(?:fac|mer)?-?[A-Z][a-z]?(?:\([A-Za-z0-9+\-]{1,24}\)){1,3}\d{0,3}\b", re.I),  # fac-Ir(ppy)3
+    re.compile(r"\b(?:Compound|Cmpd\.?)\s*[A-Za-z0-9]+\b", re.I),  # Compound 1 / Cmpd. A
+]
 _MATERIAL_STOP = {"FIG", "TABLE", "EXAMPLE", "OLED", "PCT", "WO", "US", "EP"}
 _MATERIAL_HINT_RE = re.compile(
     r"\b(host|dopant|emitter|acceptor|donor|compound|material|layer|"
@@ -269,14 +264,11 @@ _EXAMPLE_HEADING_RE = re.compile(
     r"example|comparative\s+example|synthesis\s+example|preparation\s+example|device\s+example)\b",
     re.I,
 )
-_EXAMPLE_ID_PATTERNS = [
-    re.compile(r"(?:实施例|对比例|合成例|制备例|器件例)\s*([0-9A-Za-z\-]+)", re.I),
-    re.compile(
-        r"(?:example|comparative\s+example|synthesis\s+example|preparation\s+example|device\s+example)"
-        r"\s*([0-9A-Za-z\-]+)",
-        re.I,
-    ),
-]
+_EXAMPLE_HEAD_RE = re.compile(
+    r"^\s*(?:实施例|合成例|制备例|器件例|对比例|example|comparative\s+example|"
+    r"synthesis\s+example|preparation\s+example|device\s+example)\s*([0-9A-Za-z\-]+)\b",
+    re.I,
+)
 _MAT_CANON_KEY_RE = re.compile(r"[^A-Za-z0-9]+")
 _MAT_ALIAS_LEXICON = {
     "4,4'-bis(carbazol-9-yl)biphenyl": "CBP",
@@ -316,7 +308,7 @@ _ROW_KEY_COL_HINT_RE = re.compile(
 _ROLE_PREFIX_ONLY_RE = re.compile(r"^\s*(?:material|compound|is|was|:|：|=|-|\(|\)|\.)*\s*$", re.I)
 _ROLE_AS_CUE_RE = re.compile(r"\b(?:was\s+used\s+as|used\s+as|served\s+as|acts?\s+as|as)\b", re.I)
 _IN_LAYER_CUE_RE = re.compile(r"\bin\b", re.I)
-_ROLE_CHUNK_SPLIT_RE = re.compile(r"[,，]\s*|\b(?:and|or|with)\b|以及|并且", re.I)
+_ROLE_CHUNK_SPLIT_RE = re.compile(r"[,，;；:：]\s*|\b(?:and|or|with|wherein)\b|以及|并且", re.I)
 
 
 class _SimpleHTMLTableParser(HTMLParser):
@@ -408,6 +400,151 @@ def _extract_table_units(rows: list[list[dict]]) -> list[str]:
                 if len(m) <= 12:
                     units.add(m)
     return sorted(units)
+
+
+def _assign_table_cell_entity_ids(
+    table_struct: dict,
+    table_id: str,
+    material_alias_map: dict[str, str] | None = None,
+) -> None:
+    rows = table_struct.get("rows", []) if isinstance(table_struct, dict) else []
+    for r_idx, row in enumerate(rows, 1):
+        if not isinstance(row, list):
+            continue
+        for c_idx, cell in enumerate(row, 1):
+            if not isinstance(cell, dict):
+                continue
+            text = _cell_text(cell)
+            if material_alias_map is not None and text:
+                _update_material_alias_map(text, material_alias_map)
+            ents = cell.get("entities")
+            if not isinstance(ents, list):
+                ents = _extract_entities(text)
+            for ei, ent in enumerate(ents, 1):
+                if not isinstance(ent, dict):
+                    continue
+                if not ent.get("entity_id"):
+                    ent["entity_id"] = f"{table_id}_r{r_idx:03d}_c{c_idx:03d}_e{ei:03d}"
+            if material_alias_map is not None:
+                _assign_material_canonical_ids(ents, material_alias_map)
+            if ents:
+                cell["entities"] = ents
+
+
+def _infer_table_schema(rows: list[list[dict]]) -> dict[int, dict]:
+    expanded_rows = _expand_table_rows(rows)
+    if not expanded_rows:
+        return {}
+    header_rows = _detect_header_row_count(expanded_rows)
+    headers = _collect_col_headers(expanded_rows, header_rows)
+    material_col = _detect_material_col(headers)
+
+    schema: dict[int, dict] = {}
+    has_metric_col = False
+    for col_idx, header_text in headers.items():
+        unit = _extract_header_unit(header_text)
+        if col_idx == material_col:
+            schema[col_idx] = {
+                "kind": "row_key",
+                "header_text": header_text,
+                "header_rows": header_rows,
+                "unit": unit,
+            }
+            continue
+        metric = _extract_metric_from_header(header_text)
+        role = _extract_role_from_header(header_text)
+        if metric:
+            has_metric_col = True
+            schema[col_idx] = {
+                "kind": "metric",
+                "metric": metric,
+                "header_text": header_text,
+                "header_rows": header_rows,
+                "unit": unit,
+            }
+            continue
+        if role:
+            schema[col_idx] = {
+                "kind": "role",
+                "role": role,
+                "header_text": header_text,
+                "header_rows": header_rows,
+                "unit": unit,
+            }
+            continue
+        schema[col_idx] = {
+            "kind": "other",
+            "header_text": header_text,
+            "header_rows": header_rows,
+            "unit": unit,
+        }
+
+    # 若没识别出 metric 列，则把非 row_key 且非 role 的列作为 metric 列兜底
+    if not has_metric_col:
+        for col_idx, meta in schema.items():
+            if meta.get("kind") in {"row_key", "role"}:
+                continue
+            candidate = (meta.get("header_text") or f"col_{col_idx + 1}").strip()
+            if not candidate:
+                continue
+            meta["kind"] = "metric"
+            meta["metric"] = candidate
+    return schema
+
+
+def _infer_table_row_keys(rows: list[list[dict]], header_map: dict[int, dict]) -> dict[int, dict]:
+    expanded_rows = _expand_table_rows(rows)
+    if not expanded_rows:
+        return {}
+    if not header_map:
+        return {}
+    header_rows = max(int(meta.get("header_rows", 1)) for meta in header_map.values() if isinstance(meta, dict))
+    material_col = 0
+    for col_idx, meta in header_map.items():
+        if meta.get("kind") == "row_key":
+            material_col = col_idx
+            break
+
+    out: dict[int, dict] = {}
+    for row_idx in range(header_rows, len(expanded_rows)):
+        row = expanded_rows[row_idx]
+        cells = [c for c in row if isinstance(c, dict)]
+        if not cells or _is_header_row(cells):
+            continue
+        row_key_text = _cell_text(row[material_col]) if material_col < len(row) else ""
+        if not row_key_text:
+            continue
+        out[row_idx] = {
+            "row_idx": row_idx,
+            "row_key_text": row_key_text,
+            "material_col": material_col,
+        }
+    return out
+
+
+def _collect_table_entities_from_cells(table_struct: dict) -> list[dict]:
+    rows = table_struct.get("rows", []) if isinstance(table_struct, dict) else []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        for cell in row:
+            if not isinstance(cell, dict):
+                continue
+            ents = cell.get("entities")
+            if not isinstance(ents, list):
+                continue
+            for ent in ents:
+                if not isinstance(ent, dict):
+                    continue
+                ent_id = ent.get("entity_id")
+                if isinstance(ent_id, str) and ent_id and ent_id in seen:
+                    continue
+                if isinstance(ent_id, str) and ent_id:
+                    seen.add(ent_id)
+                out.append(ent)
+    return out
 
 
 def _normalize_bbox(bbox_norm: list[int], page: PageInfo | None) -> dict:
@@ -517,6 +654,53 @@ def _has_material_context(text: str, span: list[int], token: str) -> bool:
     return _MATERIAL_HINT_RE.search(text[start:end]) is not None
 
 
+def _dedup_entity_spans(entities: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for ent in entities:
+        if not isinstance(ent, dict):
+            continue
+        etype = str(ent.get("type") or "unknown")
+        span = ent.get("span")
+        if not isinstance(span, list) or len(span) != 2:
+            continue
+        try:
+            start = int(span[0])
+            end = int(span[1])
+        except Exception:
+            continue
+        token = str(ent.get("value") or "").strip().lower()
+        key = (etype, start, end, token)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ent)
+    return out
+
+
+def _extract_material_mentions(text: str) -> list[dict]:
+    cands: list[dict] = []
+    for pat in _MATERIAL_PATTERNS:
+        for m in pat.finditer(text):
+            token = m.group(0).strip()
+            if not token:
+                continue
+            span = [m.start(), m.end()]
+            if token.upper() in _MATERIAL_STOP:
+                continue
+            if not _has_material_context(text, span, token):
+                continue
+            cands.append(
+                {
+                    "type": "material",
+                    "value": token,
+                    "normalized": token.lower(),
+                    "span": span,
+                }
+            )
+    return _dedup_entity_spans(cands)
+
+
 def _extract_entities(text: str) -> list[dict]:
     entities: list[dict] = []
     if not text:
@@ -574,19 +758,7 @@ def _extract_entities(text: str) -> list[dict]:
                 "span": [m.start(), m.end()],
             })
 
-    for m in _MATERIAL_RE.finditer(text):
-        token = m.group(0)
-        span = [m.start(), m.end()]
-        if token.upper() in _MATERIAL_STOP:
-            continue
-        if not _has_material_context(text, span, token):
-            continue
-        entities.append({
-            "type": "material",
-            "value": token,
-            "normalized": token.lower(),
-            "span": span,
-        })
+    entities.extend(_extract_material_mentions(text))
 
     for key, canonical in _LAYER_SYNONYMS.items():
         for m in re.finditer(rf"\b{re.escape(key)}\b", lower):
@@ -796,7 +968,12 @@ def _split_role_chunks(text: str, sent: tuple[int, int]) -> list[tuple[int, int]
     return chunks or [sent]
 
 
-def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[dict]:
+def _bind_material_roles(
+    text: str,
+    entities: list[dict],
+    base_id: str,
+    max_distance: int = 40,
+) -> list[dict]:
     materials = [e for e in entities if e.get("type") == "material" and e.get("span")]
     roles = [e for e in entities if e.get("type") == "role" and e.get("span")]
     layers = [e for e in entities if e.get("type") == "device_layer" and e.get("span")]
@@ -937,6 +1114,9 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                 role_span = role.get("span")
                 if not role_id or not isinstance(role_span, list):
                     continue
+                dist = abs(role_span[0] - mat_span[0])
+                if max_distance > 0 and dist > max_distance:
+                    continue
                 pair_key = (mat_id, role_id, "has_role")
                 if pair_key in bound_pairs:
                     continue
@@ -948,7 +1128,7 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                     "target_entity_id": role_id,
                     "confidence": CONFIDENCE_SCORES["chunk_role_binding"],
                     "rule": "chunk_role_binding",
-                    "distance": abs(role_span[0] - mat_span[0]),
+                    "distance": dist,
                     "sentence_id": f"{base_id}_s{sid:03d}",
                 })
 
@@ -970,6 +1150,9 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                 continue
             if role_id in bound_role_ids:
                 continue
+            dist = abs(role_span[0] - mspan[0])
+            if max_distance > 0 and dist > max_distance:
+                continue
             pair_key = (src_id, role_id, "has_role")
             if pair_key in bound_pairs:
                 continue
@@ -981,7 +1164,7 @@ def _bind_material_roles(text: str, entities: list[dict], base_id: str) -> list[
                 "target_entity_id": role_id,
                 "confidence": CONFIDENCE_SCORES["nearest_role"],
                 "rule": "nearest_role",
-                "distance": abs(role_span[0] - mspan[0]),
+                "distance": dist,
                 "sentence_id": f"{base_id}_s{sid:03d}",
             })
     return relations
@@ -1212,141 +1395,173 @@ def _collect_table_entities_relations(
     expanded_rows = _expand_table_rows(rows)
     if not expanded_rows:
         return [], []
-    header_rows = _detect_header_row_count(expanded_rows)
-    headers = _collect_col_headers(expanded_rows, header_rows)
-    material_col = _detect_material_col(headers)
-    metric_cols: dict[int, str] = {}
-    role_cols: dict[int, str] = {}
-    unit_by_col: dict[int, str | None] = {}
 
-    for col, header_text in headers.items():
-        unit_by_col[col] = _extract_header_unit(header_text)
-        if col == material_col:
-            continue
-        metric = _extract_metric_from_header(header_text)
-        role = _extract_role_from_header(header_text)
-        if metric:
-            metric_cols[col] = metric
-        if role:
-            role_cols[col] = role
-
-    # 兜底：若没识别出 metric 列，则把非材料列按列头名称当作 metric
-    if not metric_cols:
-        for col, header_text in headers.items():
-            if col == material_col:
-                continue
-            candidate = (header_text or f"col_{col + 1}").strip()
-            if candidate:
-                metric_cols[col] = candidate
-
-    table_entities: list[dict] = []
+    table_struct = {"rows": rows}
+    table_entities: list[dict] = _collect_table_entities_from_cells(table_struct)
     table_relations: list[dict] = []
-    ent_seq = 1
+
+    schema = _infer_table_schema(rows)
+    row_keys = _infer_table_row_keys(rows, schema)
+    ent_ids = {
+        str(e.get("entity_id"))
+        for e in table_entities
+        if isinstance(e, dict) and isinstance(e.get("entity_id"), str) and e.get("entity_id")
+    }
+    ent_seq = max(len(ent_ids) + 1, 1)
     rel_seq = 1
 
-    for row_idx in range(header_rows, len(expanded_rows)):
+    def _append_entity(ent: dict) -> str | None:
+        nonlocal ent_seq
+        if not isinstance(ent, dict):
+            return None
+        ent_id = ent.get("entity_id")
+        if not isinstance(ent_id, str) or not ent_id:
+            while True:
+                candidate = f"{table_id}_e{ent_seq:03d}"
+                ent_seq += 1
+                if candidate not in ent_ids:
+                    ent_id = candidate
+                    ent["entity_id"] = ent_id
+                    break
+        if ent_id in ent_ids:
+            return ent_id
+        ent_ids.add(ent_id)
+        table_entities.append(ent)
+        return ent_id
+
+    def _append_relation(rel: dict) -> None:
+        nonlocal rel_seq
+        rel["relation_id"] = f"{table_id}_r{rel_seq:03d}"
+        rel_seq += 1
+        table_relations.append(rel)
+
+    metric_cols = {c: m for c, m in schema.items() if m.get("kind") == "metric"}
+    role_cols = {c: m for c, m in schema.items() if m.get("kind") == "role"}
+
+    for row_idx in sorted(row_keys):
+        row_meta = row_keys[row_idx]
         row = expanded_rows[row_idx]
-        cells = [c for c in row if isinstance(c, dict)]
-        if not cells:
-            continue
-        if _is_header_row(cells):
-            continue
-        row_key_text = _cell_text(row[material_col]) if material_col < len(row) else ""
+        material_col = int(row_meta.get("material_col", 0))
+        row_key_text = str(row_meta.get("row_key_text") or "").strip()
         if not row_key_text:
             continue
 
         _update_material_alias_map(row_key_text, material_alias_map)
-        row_key_entities = _extract_entities(row_key_text)
-        row_mats = [e for e in row_key_entities if e.get("type") == "material"]
+        row_cell = row[material_col] if material_col < len(row) else None
+        row_cell_entities = row_cell.get("entities", []) if isinstance(row_cell, dict) else []
+        row_mats = [e for e in row_cell_entities if isinstance(e, dict) and e.get("type") == "material"]
         if row_mats:
             row_material = row_mats[0]
+            if not row_material.get("canonical_id"):
+                row_material["canonical_id"] = _promote_row_material_canonical(
+                    material_alias_map,
+                    str(row_material.get("value") or row_key_text),
+                )
         else:
             row_material = {
                 "type": "material",
                 "value": row_key_text,
                 "normalized": row_key_text.lower(),
                 "span": [0, max(1, len(row_key_text))],
+                "canonical_id": _promote_row_material_canonical(material_alias_map, row_key_text),
             }
-        row_material["entity_id"] = f"{table_id}_e{ent_seq:03d}"
-        ent_seq += 1
-        row_material["canonical_id"] = _promote_row_material_canonical(material_alias_map, str(row_material.get("value") or row_key_text))
-        table_entities.append(row_material)
+        row_material_id = _append_entity(row_material)
+        if not row_material_id:
+            continue
 
-        for col_idx, metric_name in metric_cols.items():
+        for col_idx, meta in metric_cols.items():
             if col_idx >= len(row):
                 continue
-            cell_txt = _cell_text(row[col_idx])
+            metric_name = str(meta.get("metric") or "").strip()
+            if not metric_name:
+                continue
+            cell = row[col_idx]
+            cell_txt = _cell_text(cell)
             if not cell_txt:
                 continue
 
             metric_ent = {
                 "type": "metric",
                 "value": metric_name,
-                "normalized": str(metric_name).lower(),
-                "span": [0, len(str(metric_name))],
-                "entity_id": f"{table_id}_e{ent_seq:03d}",
+                "normalized": metric_name.lower(),
+                "span": [0, len(metric_name)],
             }
-            ent_seq += 1
-            table_entities.append(metric_ent)
-
-            table_relations.append({
-                "type": "row_has_metric",
-                "source_entity_id": row_material["entity_id"],
-                "target_entity_id": metric_ent["entity_id"],
-                "relation_id": f"{table_id}_r{rel_seq:03d}",
-                "confidence": 0.92,
-                "rule": "table_row_key_binding",
-                "distance": abs(col_idx - material_col),
-                "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
-            })
-            rel_seq += 1
-
-            value_entities = _extract_cell_value_entities(metric_name, cell_txt, unit_by_col.get(col_idx))
-            if not value_entities:
+            metric_id = _append_entity(metric_ent)
+            if not metric_id:
                 continue
-            for val in value_entities:
-                val["entity_id"] = f"{table_id}_e{ent_seq:03d}"
-                ent_seq += 1
-                table_entities.append(val)
-                table_relations.append({
-                    "type": "has_value",
-                    "source_entity_id": metric_ent["entity_id"],
-                    "target_entity_id": val["entity_id"],
-                    "relation_id": f"{table_id}_r{rel_seq:03d}",
-                    "confidence": 0.95,
-                    "rule": "table_col_binding",
-                    "distance": 0,
-                    "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
-                })
-                rel_seq += 1
 
-        for col_idx, role_name in role_cols.items():
+            _append_relation(
+                {
+                    "type": "row_has_metric",
+                    "source_entity_id": row_material_id,
+                    "target_entity_id": metric_id,
+                    "confidence": 0.92,
+                    "rule": "table_row_key_binding",
+                    "distance": abs(col_idx - material_col),
+                    "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
+                }
+            )
+
+            header_unit = meta.get("unit")
+            cell_entities = cell.get("entities", []) if isinstance(cell, dict) else []
+            value_entities = [
+                e for e in cell_entities
+                if isinstance(e, dict) and e.get("type") == "value"
+            ]
+            if not value_entities:
+                value_entities = _extract_cell_value_entities(metric_name, cell_txt, header_unit)
+            for val in value_entities:
+                if header_unit and not val.get("unit"):
+                    val["unit"] = header_unit
+                val_id = _append_entity(val)
+                if not val_id:
+                    continue
+                _append_relation(
+                    {
+                        "type": "has_value",
+                        "source_entity_id": metric_id,
+                        "target_entity_id": val_id,
+                        "confidence": 0.95,
+                        "rule": "table_col_binding",
+                        "distance": 0,
+                        "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
+                    }
+                )
+
+        for col_idx, meta in role_cols.items():
             if col_idx >= len(row):
                 continue
-            cell_txt = _cell_text(row[col_idx])
+            role_name = str(meta.get("role") or "").strip()
+            if not role_name:
+                continue
+            cell = row[col_idx]
+            cell_txt = _cell_text(cell)
             if not cell_txt:
                 continue
-            role_ent = {
-                "type": "role",
-                "value": role_name,
-                "span": [0, len(str(role_name))],
-                "entity_id": f"{table_id}_e{ent_seq:03d}",
-            }
-            ent_seq += 1
-            table_entities.append(role_ent)
-            table_relations.append({
-                "type": "has_role",
-                "source_entity_id": row_material["entity_id"],
-                "target_entity_id": role_ent["entity_id"],
-                "relation_id": f"{table_id}_r{rel_seq:03d}",
-                "confidence": 0.9,
-                "rule": "table_role_column",
-                "distance": abs(col_idx - material_col),
-                "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
-            })
-            rel_seq += 1
+            cell_entities = cell.get("entities", []) if isinstance(cell, dict) else []
+            role_entities = [
+                e for e in cell_entities
+                if isinstance(e, dict) and e.get("type") == "role"
+            ]
+            if not role_entities:
+                role_entities = [{"type": "role", "value": role_name, "span": [0, len(role_name)]}]
+            for role_ent in role_entities:
+                role_id = _append_entity(role_ent)
+                if not role_id:
+                    continue
+                _append_relation(
+                    {
+                        "type": "has_role",
+                        "source_entity_id": row_material_id,
+                        "target_entity_id": role_id,
+                        "confidence": 0.9,
+                        "rule": "table_role_column",
+                        "distance": abs(col_idx - material_col),
+                        "sentence_id": f"{table_id}_row{row_idx + 1:03d}",
+                    }
+                )
 
-    if table_entities:
+    if table_entities and table_relations:
         return table_entities, table_relations
 
     # 兜底：极端坏表格结构，退回按行文本抽取，避免完全无结构产出
@@ -1359,28 +1574,26 @@ def _collect_table_entities_relations(
         _update_material_alias_map(bind_text, material_alias_map)
         row_entities = _extract_entities(bind_text)
         for ent in row_entities:
-            ent["entity_id"] = f"{table_id}_e{ent_seq:03d}"
-            ent_seq += 1
+            _append_entity(ent)
         _assign_material_canonical_ids(row_entities, material_alias_map)
         row_relations = _bind_metric_values(bind_text, row_entities, base_id=f"{table_id}_row{row_idx:03d}")
         row_relations.extend(_bind_material_roles(bind_text, row_entities, base_id=f"{table_id}_row{row_idx:03d}"))
         for rel in row_relations:
-            rel["relation_id"] = f"{table_id}_r{rel_seq:03d}"
-            rel_seq += 1
-        table_entities.extend(row_entities)
-        table_relations.extend(row_relations)
+            _append_relation(rel)
     return table_entities, table_relations
 
 
 def _extract_example_id(text: str) -> str | None:
-    for pat in _EXAMPLE_ID_PATTERNS:
-        m = pat.search(text)
-        if m:
-            token = m.group(1).strip()
-            if re.search(r"\d", token):
-                return token
-            if re.fullmatch(r"[A-Za-z]", token):
-                return token
+    m = _EXAMPLE_HEAD_RE.match(text.strip())
+    if not m:
+        return None
+    token = m.group(1).strip()
+    if not token:
+        return None
+    if re.search(r"\d", token):
+        return token
+    if re.fullmatch(r"[A-Za-z]", token):
+        return token
     return None
 
 
@@ -1653,17 +1866,11 @@ def build_structured_json(
             caption_list = item.get("table_caption", []) or []
             table_id = f"{block_id}_table"
             table_struct = _parse_table_html(html, block_id=table_id) if html else {"rows": []}
-            for r_idx, row in enumerate(table_struct.get("rows", []), 1):
-                for c_idx, cell in enumerate(row, 1):
-                    if not isinstance(cell, dict):
-                        continue
-                    _update_material_alias_map(cell.get("text", ""), material_alias_map)
-                    ents = cell.get("entities") or []
-                    for ei, ent in enumerate(ents, 1):
-                        ent["entity_id"] = f"{table_id}_r{r_idx:03d}_c{c_idx:03d}_e{ei:03d}"
-                    _assign_material_canonical_ids(ents, material_alias_map)
-                    if ents:
-                        cell["entities"] = ents
+            _assign_table_cell_entity_ids(
+                table_struct=table_struct,
+                table_id=table_id,
+                material_alias_map=material_alias_map,
+            )
             table_entities, table_relations = _collect_table_entities_relations(
                 table_struct.get("rows", []),
                 table_id=table_id,
