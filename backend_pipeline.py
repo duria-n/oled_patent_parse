@@ -32,6 +32,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--strict", action="store_true", help="遇到坏文件直接报错")
 
     ap.add_argument("--init-pg", action="store_true", help="初始化 PostgreSQL schema（含 RDKit/AGE）")
+    ap.add_argument("--migrate-experiment-pk", action="store_true", help="迁移 experiment 表主键到 experiment_id")
+    ap.add_argument("--migrate-batch-size", type=int, default=50000, help="迁移批次大小")
     ap.add_argument("--ingest-pg", action="store_true", help="导入 PostgreSQL 关系层")
     ap.add_argument("--sync-age", action="store_true", help="导入 PG 时同步 AGE 图")
     ap.add_argument("--age-clean-orphans", action="store_true", help="离线清理 AGE 图孤儿节点")
@@ -79,6 +81,7 @@ def main() -> int:
     if not any(
         [
             args.init_pg,
+            args.migrate_experiment_pk,
             args.ingest_pg,
             args.age_clean_orphans,
             args.init_os,
@@ -100,6 +103,7 @@ def main() -> int:
 
     if (
         args.init_pg
+        or args.migrate_experiment_pk
         or args.ingest_pg
         or args.age_clean_orphans
         or args.rdkit_substruct
@@ -180,6 +184,11 @@ def main() -> int:
         assert pg_store is not None
         pg_store.init_schema()
         logger.info("PostgreSQL schema 初始化完成")
+
+    if args.migrate_experiment_pk:
+        assert pg_store is not None
+        pg_store.migrate_experiment_primary_key(batch_size=args.migrate_batch_size)
+        logger.info("experiment 主键迁移完成")
 
     if args.ingest_pg:
         assert pg_store is not None

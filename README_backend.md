@@ -43,6 +43,9 @@ export OPENAI_API_KEY='sk-...'
 # 初始化 PostgreSQL（含 rdkit/age extension + schema）
 python backend_pipeline.py --init-pg
 
+# 旧库升级：把 experiment 主键迁移为 experiment_id（首次升级执行一次）
+python backend_pipeline.py --migrate-experiment-pk --migrate-batch-size 50000
+
 # 导入 PostgreSQL，并同步 AGE 图
 python backend_pipeline.py --ingest-pg --sync-age --inputs md output
 
@@ -100,6 +103,7 @@ $$) AS (doc_id agtype, block_id agtype, entity_id agtype, value_text agtype);
 - 如需更高质量语义检索，建议使用：
   - `--embedder openai --openai-embed-model text-embedding-3-small`
 - 当前实现采用“文档级幂等 upsert + 明细重建”，适合离线批处理与增量重跑。
+- `--init-pg` 仅做 schema/extension 初始化；历史库的 experiment 主键升级需单独执行 `--migrate-experiment-pk`。
 
 ## 7. 健康检查与数据检查
 

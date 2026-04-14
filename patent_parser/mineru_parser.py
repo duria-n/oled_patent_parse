@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import (
     ProcessPoolExecutor,
@@ -119,18 +120,13 @@ def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
     """
     import os as _os
 
-    fallback_reason: str | None = None
-    fallback_mode: str | None = None
     try:
         gpu_id = gpu_queue.get(timeout=10)
-    except Exception as exc:
-        fallback_reason = f"{type(exc).__name__}"
+    except Exception:
         if fallback_gpu_ids:
             gpu_id = fallback_gpu_ids[_os.getpid() % len(fallback_gpu_ids)]
-            fallback_mode = "pid_mod_fallback"
         else:
             gpu_id = 0
-            fallback_mode = "hardcoded_gpu0"
 
     gpu_str = str(gpu_id)
     _os.environ["WORKER_GPU_ID"] = gpu_str
@@ -155,16 +151,6 @@ def _init_worker(gpu_queue, fallback_gpu_ids, log_path):
         except Exception:
             pass
 
-    if fallback_reason:
-        logger.warning(
-            "worker GPU 槽位获取失败（%s），已退化绑定 GPU=%s（mode=%s, candidates=%s）。"
-            "若频繁出现，可能导致单卡过载/OOM。",
-            fallback_reason,
-            gpu_str,
-            fallback_mode,
-            list(fallback_gpu_ids) if fallback_gpu_ids else [],
-        )
-
 
 class MinerUPatentParser(BasePDFParser):
     """使用 MinerU 解析专利 PDF 的具体实现。"""
@@ -187,6 +173,7 @@ class MinerUPatentParser(BasePDFParser):
         parser_version: str | None = None,
         parse_timeout_sec: int = 1800,
         render_workers: int = 0,
+        model_dir: str | None = None,
     ):
         super().__init__(input_root, output_root)
         self.langs = langs if langs else ["ch", "chinese_cht", "japan", "en", "korean"]
@@ -200,6 +187,7 @@ class MinerUPatentParser(BasePDFParser):
         self.keep_raw = keep_raw
         self.parser_version = parser_version or PARSER_VERSION
         self.parse_timeout_sec = max(1, int(parse_timeout_sec))
+        self.model_dir = str(Path(model_dir).resolve()) if model_dir else None
 
         total_gpus = _get_gpu_count()
         if gpu_ids is not None:
@@ -235,8 +223,16 @@ class MinerUPatentParser(BasePDFParser):
             render_source,
             self.workers * self.render_workers,
         )
+        if self.model_dir:
+            logger.info("使用本地模型目录: %s", self.model_dir)
         # 跨子文件夹汇总失败记录
         self._all_failed: list[str] = []
+        # 协作式中断标志：主进程 SIGINT handler 设置后，各层循环检测并退出
+        self._interrupt_event = threading.Event()
+
+    def get_interrupt_event(self) -> threading.Event:
+        """供外部（如 CLI 的 SIGINT handler）获取中断事件。"""
+        return self._interrupt_event
 
     def run(self) -> None:
         """覆盖基类 run()，在所有子文件夹处理完毕后统一写 failed_files.txt。"""
@@ -289,6 +285,7 @@ class MinerUPatentParser(BasePDFParser):
             gpu_id=gpu_id,
             timeout_sec=self.parse_timeout_sec,
             render_workers=self.render_workers,
+            model_dir=self.model_dir,
         )
 
     def parse_pdfs(self, pdf_files: list[Path], output_dir: Path) -> None:
@@ -332,6 +329,10 @@ class MinerUPatentParser(BasePDFParser):
         if tqdm and use_tqdm and sys.stderr.isatty():
             seq_iter = tqdm(pending, total=pending_total, desc="PDFs", unit="file")
         for i, (idx, pdf_path, lang, is_scanned, lang_source) in enumerate(seq_iter, 1):
+            # 检查协作式中断标志
+            if self._interrupt_event.is_set():
+                logger.warning("检测到中断标志，停止后续解析")
+                raise KeyboardInterrupt
             gpu_id = self.gpu_ids[0]
             method_info = "OCR（扫描件）" if is_scanned else self.parse_method
             logger.info("[%d/%d] 正在解析: %s (语言: %s, 方法: %s, GPU: %d)",
@@ -339,71 +340,11 @@ class MinerUPatentParser(BasePDFParser):
             t0 = time.time()
             success, err, warnings = self._parse_one(pdf_path, lang, output_dir, is_scanned, gpu_id)
             elapsed = time.time() - t0
-            if success:
-                post_ok = self._postprocess_if_needed(
-                    pdf_path, output_dir, "ocr" if is_scanned else self.parse_method
-                )
-                if post_ok:
-                    status = "done_without_tables" if warnings.get("table_fallback_used") else "done"
-                    done.mark(
-                        pdf_path.name, lang, status,
-                        lang_source=lang_source,
-                        table_fallback_used=bool(warnings.get("table_fallback_used")),
-                        done_with_warnings=bool(warnings),
-                        warnings=warnings or None,
-                    )
-                    logger.info("[%d/%d] 解析完成: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
-                    if warnings:
-                        logger.warning(
-                            "[%d/%d] 解析告警: %s — %s",
-                            i,
-                            pending_total,
-                            pdf_path.name,
-                            _format_warning_summary(warnings),
-                        )
-                else:
-                    done.mark(
-                        pdf_path.name, lang, "failed",
-                        error_msg="后处理失败或结构化输出缺失",
-                        lang_source=lang_source,
-                        table_fallback_used=bool(warnings.get("table_fallback_used")),
-                        done_with_warnings=bool(warnings),
-                        warnings=warnings or None,
-                    )
-                    logger.error("[%d/%d] 后处理失败: %s (耗时 %.2fs)", i, pending_total, pdf_path.name, elapsed)
-                    if warnings:
-                        logger.error(
-                            "[%d/%d] 失败上下文: %s — %s",
-                            i,
-                            pending_total,
-                            pdf_path.name,
-                            _format_warning_summary(warnings),
-                        )
-            else:
-                done.mark(
-                    pdf_path.name, lang, "failed",
-                    error_msg=err or "非零退出码",
-                    lang_source=lang_source,
-                    table_fallback_used=bool(warnings.get("table_fallback_used")),
-                    done_with_warnings=bool(warnings),
-                    warnings=warnings or None,
-                )
-                logger.error(
-                    "[%d/%d] 解析失败: %s (耗时 %.2fs) — %s",
-                    i,
-                    pending_total,
-                    pdf_path.name,
-                        elapsed,
-                        err or "未知错误",
-                    )
-                if warnings:
-                    logger.error(
-                        "[%d/%d] 失败上下文: %s — %s",
-                        i,
-                        pending_total,
-                        pdf_path.name,
-                        _format_warning_summary(warnings),
-                    )
+            self._record_result(
+                pdf_path, lang, is_scanned, lang_source,
+                success, err, warnings, elapsed,
+                i, pending_total, done, output_dir,
+            )
 
     def _record_result(
         self,
@@ -596,11 +537,12 @@ class MinerUPatentParser(BasePDFParser):
                 gpu_id=None,  # 交给 subprocess_worker 读 WORKER_GPU_ID
                 timeout_sec=self.parse_timeout_sec,
                 render_workers=self.render_workers,
+                model_dir=self.model_dir,
             )
 
         def _fill_window():
             nonlocal broken
-            while pending_queue and len(in_flight) < window_size and not broken:
+            while pending_queue and len(in_flight) < window_size and not broken and not self._interrupt_event.is_set():
                 item = pending_queue[0]
                 try:
                     fut = _submit(item)
@@ -628,13 +570,22 @@ class MinerUPatentParser(BasePDFParser):
             _fill_window()
 
             while in_flight and not broken:
+                # 检查协作式中断标志
+                if self._interrupt_event.is_set():
+                    _interrupted = True
+                    raise KeyboardInterrupt
                 try:
+                    # 使用短超时轮询，避免 wait() 无限阻塞导致 Ctrl+C 无响应
                     done_set, _not_done = wait(
-                        list(in_flight.keys()), return_when=FIRST_COMPLETED
+                        list(in_flight.keys()), timeout=1.0, return_when=FIRST_COMPLETED
                     )
                 except KeyboardInterrupt:
                     _interrupted = True
                     raise
+
+                if not done_set:
+                    # 超时但无任务完成，继续轮询
+                    continue
 
                 for fut in done_set:
                     item, t0 = in_flight.pop(fut)
@@ -692,11 +643,30 @@ class MinerUPatentParser(BasePDFParser):
             if pbar:
                 pbar.close()
             cancel = _interrupted or broken
+
+            # 中断时主动 cancel 所有还在排队的 future
+            if cancel:
+                for fut in list(in_flight.keys()):
+                    fut.cancel()
+
             try:
-                executor.shutdown(wait=not cancel, cancel_futures=cancel)
+                # cancel_futures=True 需要 Python 3.9+；wait=False 避免 shutdown 阻塞
+                executor.shutdown(wait=False, cancel_futures=cancel)
+            except TypeError:
+                # Python 3.8 不支持 cancel_futures 参数
+                try:
+                    executor.shutdown(wait=False)
+                except Exception:
+                    pass
             except Exception:
                 # broken 的 pool shutdown 可能也抛异常，忽略以保证 finally 走完
                 logger.debug("executor.shutdown 期间忽略异常", exc_info=True)
+
+            # 中断时强杀所有残余 worker 进程，防止子进程（含 MinerU 内部 spawn 的孙进程）
+            # 在主进程退出后变成孤儿继续占用 GPU
+            if cancel:
+                self._kill_worker_processes(executor)
+
             try:
                 gpu_queue.close()
                 gpu_queue.join_thread()
@@ -706,6 +676,39 @@ class MinerUPatentParser(BasePDFParser):
         # 把还没来得及完成的条目交回上层决定是否重试
         unfinished = list(pending_queue) + [item for (item, _) in in_flight.values()]
         return unfinished if broken else []
+
+    @staticmethod
+    def _kill_worker_processes(executor):
+        """强杀 ProcessPoolExecutor 管理的所有 worker 进程及其子进程树。
+
+        executor.shutdown(wait=False) 只是不再等 worker 结束，但不会杀它们。
+        worker 内部启动的 subprocess（do_parse）又用了 start_new_session=True
+        创建了独立进程组，必须用 killpg 才能连同孙进程一起清理。
+        """
+        import signal as _signal
+
+        pids: list[int] = []
+        try:
+            # CPython 实现细节：_processes 是 {pid: Process} 的 dict
+            processes = getattr(executor, "_processes", None)
+            if processes:
+                pids = list(processes.keys())
+        except Exception:
+            pass
+
+        for pid in pids:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            # 也尝试杀掉 worker 内部 subprocess 创建的进程组
+            try:
+                os.killpg(os.getpgid(pid), _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+        if pids:
+            logger.info("已向 %d 个 worker 进程发送 SIGKILL", len(pids))
 
     def collect_md_files(self, output_dir: Path, subdir_name: str) -> None:
         md_target = self.input_root / "md" / subdir_name

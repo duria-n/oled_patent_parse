@@ -3,11 +3,14 @@
 import logging
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger("patent_parser")
+# 仅为 patent_parser logger 配置 handler，不调用 basicConfig 以避免污染根 logger
+if not logger.handlers:
+    _console_handler = logging.StreamHandler()
+    _console_handler.setLevel(logging.INFO)
+    _console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(_console_handler)
+    logger.setLevel(logging.INFO)
 
 def add_file_logger(log_path: str | Path, level: int = logging.INFO) -> Path:
     path = Path(log_path)

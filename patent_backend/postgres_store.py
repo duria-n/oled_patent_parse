@@ -121,33 +121,6 @@ class PostgresPatentStore:
             raw JSONB NOT NULL DEFAULT '{{}}'::jsonb
         );
 
-        -- 兼容旧版本（example_id 作为主键）迁移到 experiment_id。
-        ALTER TABLE {schema}.experiment ADD COLUMN IF NOT EXISTS experiment_id TEXT;
-        ALTER TABLE {schema}.experiment ADD COLUMN IF NOT EXISTS example_id TEXT;
-        UPDATE {schema}.experiment
-        SET experiment_id = COALESCE(experiment_id, doc_id || '::' || COALESCE(example_id, 'unknown'))
-        WHERE experiment_id IS NULL;
-        UPDATE {schema}.experiment
-        SET example_id = COALESCE(example_id, split_part(experiment_id, '::', 2))
-        WHERE example_id IS NULL;
-        ALTER TABLE {schema}.experiment ALTER COLUMN experiment_id SET NOT NULL;
-        ALTER TABLE {schema}.experiment ALTER COLUMN example_id SET NOT NULL;
-        DO $$
-        DECLARE c RECORD;
-        BEGIN
-            FOR c IN
-                SELECT conname
-                FROM pg_constraint
-                WHERE conrelid = '{schema}.experiment'::regclass
-                  AND contype = 'p'
-            LOOP
-                EXECUTE 'ALTER TABLE {schema}.experiment DROP CONSTRAINT ' || quote_ident(c.conname);
-            END LOOP;
-            ALTER TABLE {schema}.experiment
-            ADD CONSTRAINT experiment_pkey PRIMARY KEY (experiment_id);
-        END
-        $$;
-
         CREATE TABLE IF NOT EXISTS {schema}.molecule (
             molecule_id BIGSERIAL PRIMARY KEY,
             doc_id TEXT NOT NULL REFERENCES {schema}.document(doc_id) ON DELETE CASCADE,
@@ -173,6 +146,121 @@ class PostgresPatentStore:
 
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(ddl)
+            conn.commit()
+
+    def migrate_experiment_primary_key(self, batch_size: int = 50000) -> None:
+        """把旧版 experiment(example_id 主键) 迁移到 experiment_id 主键。
+
+        说明：
+        - 该方法用于升级已有生产库，避免把大体量 DML 放到 init_schema 热路径。
+        - 回填采用分批更新，降低长事务和锁持有时长。
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+        schema = self.config.schema
+        table = f"{schema}.experiment"
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    experiment_id TEXT PRIMARY KEY,
+                    example_id TEXT NOT NULL,
+                    doc_id TEXT NOT NULL REFERENCES {schema}.document(doc_id) ON DELETE CASCADE,
+                    materials_used TEXT[] NOT NULL DEFAULT '{{}}',
+                    performance_relations TEXT[] NOT NULL DEFAULT '{{}}',
+                    role_relations TEXT[] NOT NULL DEFAULT '{{}}',
+                    source_block_ids TEXT[] NOT NULL DEFAULT '{{}}',
+                    raw JSONB NOT NULL DEFAULT '{{}}'::jsonb
+                );
+                ALTER TABLE {table} ADD COLUMN IF NOT EXISTS experiment_id TEXT;
+                ALTER TABLE {table} ADD COLUMN IF NOT EXISTS example_id TEXT;
+                """
+            )
+            conn.commit()
+
+            while True:
+                cur.execute(
+                    f"""
+                    WITH cte AS (
+                        SELECT ctid
+                        FROM {table}
+                        WHERE experiment_id IS NULL
+                        LIMIT %s
+                    )
+                    UPDATE {table} e
+                    SET experiment_id = COALESCE(e.doc_id, 'unknown') || '::' || COALESCE(e.example_id, 'unknown')
+                    FROM cte
+                    WHERE e.ctid = cte.ctid;
+                    """,
+                    (batch_size,),
+                )
+                affected = cur.rowcount or 0
+                conn.commit()
+                if affected == 0:
+                    break
+
+            while True:
+                cur.execute(
+                    f"""
+                    WITH cte AS (
+                        SELECT ctid
+                        FROM {table}
+                        WHERE example_id IS NULL
+                        LIMIT %s
+                    )
+                    UPDATE {table} e
+                    SET example_id = NULLIF(split_part(e.experiment_id, '::', 2), '')
+                    FROM cte
+                    WHERE e.ctid = cte.ctid;
+                    """,
+                    (batch_size,),
+                )
+                affected = cur.rowcount or 0
+                conn.commit()
+                if affected == 0:
+                    break
+
+            cur.execute(
+                f"""
+                UPDATE {table}
+                SET example_id = 'unknown'
+                WHERE example_id IS NULL;
+                """
+            )
+            cur.execute(f"ALTER TABLE {table} ALTER COLUMN experiment_id SET NOT NULL;")
+            cur.execute(f"ALTER TABLE {table} ALTER COLUMN example_id SET NOT NULL;")
+
+            cur.execute(
+                """
+                SELECT con.conname,
+                       array_agg(att.attname ORDER BY arr.n) AS cols
+                FROM pg_constraint con
+                JOIN pg_class rel ON rel.oid = con.conrelid
+                JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+                JOIN LATERAL unnest(con.conkey) WITH ORDINALITY arr(attnum, n) ON TRUE
+                JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = arr.attnum
+                WHERE nsp.nspname = %s
+                  AND rel.relname = 'experiment'
+                  AND con.contype = 'p'
+                GROUP BY con.conname;
+                """,
+                (schema,),
+            )
+            row = cur.fetchone()
+            if row:
+                pk_name, pk_cols = row
+                if pk_cols != ["experiment_id"]:
+                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", pk_name):
+                        raise RuntimeError(f"unexpected constraint name: {pk_name}")
+                    cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT {pk_name};")
+                    cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT experiment_pkey PRIMARY KEY (experiment_id);")
+            else:
+                cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT experiment_pkey PRIMARY KEY (experiment_id);")
+
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_experiment_doc ON {table}(doc_id);")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_experiment_example ON {table}(example_id);")
             conn.commit()
 
     def upsert_document(self, doc: StructuredPatentDocument, sync_graph: bool = True) -> None:
@@ -588,6 +676,26 @@ class PostgresPatentStore:
 
     @staticmethod
     def _insert_molecules_resilient(cur, schema: str, molecule_rows: list[tuple[str, str, str, str]]) -> None:
+        if not molecule_rows:
+            return
+
+        # 优先走批量写入，显著降低 savepoint/子事务开销。
+        cur.execute("SAVEPOINT mol_bulk_insert_sp;")
+        try:
+            cur.executemany(
+                f"""
+                INSERT INTO {schema}.molecule(doc_id, entity_id, smiles, mol)
+                VALUES (%s, %s, %s, mol_from_smiles(%s));
+                """,
+                molecule_rows,
+            )
+            cur.execute("RELEASE SAVEPOINT mol_bulk_insert_sp;")
+            return
+        except Exception:
+            # 任一条无效时回退到逐条容错路径。
+            cur.execute("ROLLBACK TO SAVEPOINT mol_bulk_insert_sp;")
+            cur.execute("RELEASE SAVEPOINT mol_bulk_insert_sp;")
+
         for row in molecule_rows:
             # 单条无效 SMILES 不应导致整篇文档回滚。
             cur.execute("SAVEPOINT mol_insert_sp;")
@@ -685,9 +793,35 @@ class PostgresPatentStore:
                 doc_count = int(cur.fetchone()[0])
             except Exception:
                 doc_count = 0
+            experiment_pk_cols: list[str] = []
+            migration_needed = False
+            try:
+                cur.execute(
+                    """
+                    SELECT array_agg(att.attname ORDER BY arr.n) AS cols
+                    FROM pg_constraint con
+                    JOIN pg_class rel ON rel.oid = con.conrelid
+                    JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+                    JOIN LATERAL unnest(con.conkey) WITH ORDINALITY arr(attnum, n) ON TRUE
+                    JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = arr.attnum
+                    WHERE nsp.nspname = %s
+                      AND rel.relname = 'experiment'
+                      AND con.contype = 'p'
+                    GROUP BY con.conname;
+                    """,
+                    (schema,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    experiment_pk_cols = list(row[0])
+                migration_needed = experiment_pk_cols != ["experiment_id"]
+            except Exception:
+                migration_needed = True
         return {
             "ok": True,
             "schema": schema,
             "extensions": exts,
             "document_count": doc_count,
+            "experiment_pk_columns": experiment_pk_cols,
+            "experiment_pk_migration_needed": migration_needed,
         }

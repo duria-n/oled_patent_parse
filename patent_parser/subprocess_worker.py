@@ -30,7 +30,8 @@ def subprocess_parse_one(pdf_path_str: str, output_dir_str: str, lang: str,
                          formula_enable: bool, table_enable: bool,
                          gpu_id: int | None = None,
                          timeout_sec: int = 1800,
-                         render_workers: int = 1) -> tuple[bool, str, dict]:
+                         render_workers: int = 1,
+                         model_dir: str | None = None) -> tuple[bool, str, dict]:
     # 通过临时脚本 + JSON 配置传参，避免 -c 动态拼接导致的特殊字符/注入问题
     payload = {
         "pdf_path": pdf_path_str,
@@ -154,6 +155,23 @@ if __name__ == '__main__':
     env.setdefault("MINERU_INTER_OP_NUM_THREADS", "1")
     env["MINERU_PDF_RENDER_WORKERS"] = str(max(1, int(render_workers)))
 
+    # 本地模型目录：生成临时 magic-pdf.json 并通过环境变量注入子进程
+    _tmp_config_path = None
+    if model_dir:
+        env["HF_HUB_OFFLINE"] = "1"
+        try:
+            _magic_cfg = json.dumps({"models-dir": model_dir}, ensure_ascii=False)
+            _tmp_cfg_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8",
+                prefix="magic_pdf_cfg_",
+            )
+            _tmp_cfg_file.write(_magic_cfg)
+            _tmp_cfg_file.close()
+            _tmp_config_path = Path(_tmp_cfg_file.name)
+            env["MINERU_TOOLS_CONFIG_JSON"] = str(_tmp_config_path)
+        except Exception as exc:
+            logger.warning("生成临时 magic-pdf.json 失败，将使用默认模型路径: %s", exc)
+
     stderr_file = tempfile.NamedTemporaryFile(
         mode="wb", suffix=".stderr", delete=False
     )
@@ -254,9 +272,16 @@ if __name__ == '__main__':
         return False, f"{type(exc).__name__}: {exc}", warn
 
     finally:
+        # 确保 stderr_file 的文件描述符被关闭，防止 Popen 构造异常时的 fd 泄漏
+        try:
+            stderr_file.close()
+        except Exception:
+            pass
         stderr_path.unlink(missing_ok=True)
         cfg_path.unlink(missing_ok=True)
         script_path.unlink(missing_ok=True)
+        if _tmp_config_path is not None:
+            _tmp_config_path.unlink(missing_ok=True)
 
 
 def _read_tail(path: Path, max_bytes: int) -> str:
@@ -309,6 +334,19 @@ def _looks_like_table_failure(err: str) -> bool:
     return has_table and has_err
 
 
+def _cleanup_stale_output(output_dir_str: str, pdf_path_str: str) -> None:
+    """清理首次解析失败后残留的输出目录，防止重试时读到不完整的中间产物。"""
+    try:
+        output_dir = Path(output_dir_str)
+        stem = Path(pdf_path_str).stem
+        stale_dir = output_dir / stem
+        if stale_dir.exists() and stale_dir.is_dir():
+            shutil.rmtree(stale_dir, ignore_errors=True)
+            logger.debug("已清理残留输出目录: %s", stale_dir)
+    except Exception as exc:
+        logger.debug("清理残留输出目录时忽略异常: %s", exc)
+
+
 def _parse_one_with_fallback(
     pdf_path_str: str,
     output_dir_str: str,
@@ -320,6 +358,7 @@ def _parse_one_with_fallback(
     gpu_id: int | None,
     timeout_sec: int,
     render_workers: int,
+    model_dir: str | None = None,
 ) -> tuple[bool, str, dict]:
     ok, err, warnings = subprocess_parse_one(
         pdf_path_str, output_dir_str, lang, backend,
@@ -329,6 +368,7 @@ def _parse_one_with_fallback(
         gpu_id,
         timeout_sec=timeout_sec,
         render_workers=render_workers,
+        model_dir=model_dir,
     )
     if ok or not table_enable:
         return ok, err, warnings
@@ -340,6 +380,8 @@ def _parse_one_with_fallback(
         "解析失败（可能是表格模型崩溃），禁用表格后重试: %s",
         Path(pdf_path_str).name,
     )
+    # 清理首次失败的残留输出，防止重试时读到不完整的中间产物
+    _cleanup_stale_output(output_dir_str, pdf_path_str)
     ok2, err2, retry_warn = subprocess_parse_one(
         pdf_path_str, output_dir_str, lang, backend,
         parse_method,
@@ -348,6 +390,7 @@ def _parse_one_with_fallback(
         gpu_id=gpu_id,
         timeout_sec=timeout_sec,
         render_workers=render_workers,
+        model_dir=model_dir,
     )
     merged_warn = {
         "table_fallback_used": True,
@@ -393,6 +436,7 @@ def subprocess_parse_one_smart(
     page_limit: int = 60,
     timeout_sec: int = 1800,
     render_workers: int = 1,
+    model_dir: str | None = None,
 ) -> tuple[bool, str, dict]:
     import importlib
     _splitter = importlib.import_module("patent_parser.pdf_splitter")
@@ -413,12 +457,14 @@ def subprocess_parse_one_smart(
         return _parse_one_with_fallback(
             pdf_path_str, output_dir_str, lang, backend,
             parse_method, formula_enable, table_enable, gpu_id, timeout_sec, render_workers,
+            model_dir=model_dir,
         )
 
     if page_count <= page_limit:
         return _parse_one_with_fallback(
             pdf_path_str, output_dir_str, lang, backend,
             parse_method, formula_enable, table_enable, gpu_id, timeout_sec, render_workers,
+            model_dir=model_dir,
         )
 
     logger.info(
@@ -435,6 +481,7 @@ def subprocess_parse_one_smart(
         return _parse_one_with_fallback(
             pdf_path_str, output_dir_str, lang, backend,
             parse_method, formula_enable, table_enable, gpu_id, timeout_sec, render_workers,
+            model_dir=model_dir,
         )
 
     tmp_dir = part_paths[0].parent
@@ -463,6 +510,7 @@ def subprocess_parse_one_smart(
                 ok, err, warn = _parse_one_with_fallback(
                     str(part_path), output_dir_str, lang, backend,
                     parse_method, formula_enable, table_enable, gpu_id, timeout_sec, render_workers,
+                    model_dir=model_dir,
                 )
                 _merge_part_warnings(warnings, warn, part_path.name)
                 if not ok:
@@ -478,22 +526,22 @@ def subprocess_parse_one_smart(
                 pbar.close()
 
         if failed_parts:
-            logger.error("  存在失败分片，跳过正式合并: %s", ", ".join(failed_parts))
+            logger.error("  存在失败分片，尝试合并已成功分片: %s", ", ".join(failed_parts))
             try:
-                merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=True)
+                merge_markdown_parts(part_paths, output_dir, pdf_path.stem, require_all_parts=False)
             except Exception:
                 logger.exception("  分片 md 合并异常: %s", pdf_path.name)
             try:
                 merge_content_list_parts(
                     part_paths, output_dir, pdf_path.stem,
-                    require_all_parts=True, chunk_size=page_limit,
+                    require_all_parts=False, chunk_size=page_limit,
                 )
             except Exception:
                 logger.exception("  分片 content_list 合并异常: %s", pdf_path.name)
             try:
                 merge_middle_json_parts(
                     part_paths, output_dir, pdf_path.stem,
-                    require_all_parts=True, chunk_size=page_limit,
+                    require_all_parts=False, chunk_size=page_limit,
                 )
             except Exception:
                 logger.exception("  分片 middle.json 合并异常: %s", pdf_path.name)
@@ -531,7 +579,7 @@ def subprocess_parse_one_smart(
         #                 len(part_paths) - len(failed_parts), len(part_paths), merged)
         #     return True, "", warnings
 
-        logger.error("%s 合并失败或不完整: %s", missing, pdf_path.name)
+        logger.error("%s 合并失败或不完整，缺少: %s", pdf_path.name, missing)
         warnings["merge_missing"] = missing
         return False, "分片合并失败或缺失 md/content_list/middle", warnings
     finally:

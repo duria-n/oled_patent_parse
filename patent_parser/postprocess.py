@@ -369,13 +369,16 @@ def _classify_text_block(text: str, context: dict) -> str:
             if section in {"background", "summary", "drawings_desc", "detailed_desc"}:
                 context["section"] = "description"
                 context["subsection"] = section
+                context["example_id"] = None
                 return "title"
             context["section"] = section
             context["subsection"] = None
+            context["example_id"] = None
             return "title" if section != "claims" else "claims_title"
     for key, pats in _EXAMPLE_KEYWORDS.items():
         if _match_any(t, pats):
             context["section"] = key
+            context["example_id"] = None
             return key
 
     if context.get("section") == "abstract":
@@ -660,7 +663,7 @@ def _extract_example_id(text: str) -> str | None:
     return m.group(1)
 
 
-def _extract_claim_depends(text: str) -> list[int]:
+def _extract_claim_depends(text: str, self_claim_no: int | None = None) -> list[int]:
     m = _CLAIM_DEP_RE.search(text)
     if not m:
         return []
@@ -677,6 +680,9 @@ def _extract_claim_depends(text: str) -> list[int]:
             nums.add(int(num_str))
         except ValueError:
             continue
+    # 排除自引用，避免 claim tree 出现循环
+    if self_claim_no is not None:
+        nums.discard(self_claim_no)
     return sorted(nums)
 
 
@@ -884,10 +890,6 @@ def build_structured_json(
                 }:
                     context["example_id"] = None
             example_id = context.get("example_id")
-            if sem_type.startswith("claim"):
-                depends_on = _extract_claim_depends(text)
-            else:
-                depends_on = []
             claim_no = None
             if sem_type.startswith("claim"):
                 cm = _CLAIM_RE.match(text)
@@ -896,6 +898,10 @@ def build_structured_json(
                         claim_no = int(cm.group(1))
                     except ValueError:
                         claim_no = None
+            if sem_type.startswith("claim"):
+                depends_on = _extract_claim_depends(text, self_claim_no=claim_no)
+            else:
+                depends_on = []
 
             if sem_type == "description" or context.get("subsection") in {"background", "summary", "drawings_desc", "detailed_desc"}:
                 for m in _REF_NUM_RE.finditer(text):

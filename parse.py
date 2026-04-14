@@ -3,6 +3,7 @@
 import argparse
 import logging
 import multiprocessing
+import os
 import signal
 import sys
 from datetime import datetime
@@ -95,6 +96,9 @@ def main():
                          "极易撞 --timeout-minutes 而失败。")
     ap.add_argument("--log-file", default=None,
                     help="日志文件路径（默认输出到 output/logs/run_YYYYmmdd_HHMMSS.log）")
+    ap.add_argument("--model-dir", default=None,
+                    help="MinerU 模型本地目录路径（避免运行时从 HuggingFace 下载）。\n"
+                         "指定后会自动生成 magic-pdf.json 并注入子进程环境变量。")
     args = ap.parse_args()
     if args.timeout_minutes <= 0:
         ap.error("--timeout-minutes 必须大于 0")
@@ -142,14 +146,23 @@ def main():
         parser_version=args.parser_version,
         parse_timeout_sec=max(1, int(args.timeout_minutes * 60)),
         render_workers=args.render_workers,
+        model_dir=args.model_dir,
     )
 
-    # 捕获 Ctrl+C：打印提示后正常退出，让底层清理逻辑（finally 块）有机会执行
+    # 捕获 Ctrl+C：
+    # 第一次 Ctrl+C → 设置中断标志，让正在运行的逻辑有机会优雅退出；
+    # 第二次 Ctrl+C → 恢复默认行为，立刻终止。
+    _interrupted_event = parser.get_interrupt_event()
+
     def _sigint_handler(signum, frame):
-        logger.warning("收到中断信号（Ctrl+C），正在退出，请稍候...")
-        # 将信号重置为默认，再次 Ctrl+C 可强制杀死
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        # 抛出 KeyboardInterrupt 让 Python 正常展开调用栈（触发所有 finally）
+        if _interrupted_event.is_set():
+            # 已经发过一次中断，恢复默认行为让用户可以强杀
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            logger.warning("再次收到中断信号，强制退出...")
+            os._exit(130)
+        logger.warning("收到中断信号（Ctrl+C），正在优雅停止，再按一次强制退出...")
+        _interrupted_event.set()
+        # 同时抛出 KeyboardInterrupt 以打断当前阻塞点（如 proc.wait / futue.wait）
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _sigint_handler)

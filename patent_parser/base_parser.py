@@ -30,7 +30,7 @@ class BasePDFParser(ABC):
         for subdir in subdirs:
             # 处理根目录的情况
             if subdir == self.input_root:
-                rel_str = "根目录"
+                rel_str = "root_pdfs"
             else:
                 rel_str = str(subdir.relative_to(self.input_root))
                 
@@ -41,7 +41,7 @@ class BasePDFParser(ABC):
                 continue
             output_dir = self.prepare_output_dir(subdir)
             self.parse_pdfs(pdf_files, output_dir)
-            self.collect_md_files(output_dir, "root" if subdir == self.input_root else rel_str)
+            self.collect_md_files(output_dir, rel_str)
             logger.info("===== %s 处理完毕 =====\n", rel_str)
 
     def discover_subdirs(self) -> list[Path]:

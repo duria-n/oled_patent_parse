@@ -227,18 +227,34 @@ def merge_content_list_parts(
             invalid_parts.append(part_stem)
             logger.warning("分片 %s content_list 格式异常：根节点不是 list", part_stem)
             continue
+
+        # 复制并重命名资源文件，使 _rewrite_img_path 生成的路径有效
+        part_out_dir = output_dir / part_stem
+        for res_dir_name in _RESOURCE_DIR_NAMES:
+            part_res_dir = part_out_dir / res_dir_name
+            if not (part_res_dir.exists() and part_res_dir.is_dir()):
+                continue
+            target_res_dir = merged_dir / res_dir_name
+            target_res_dir.mkdir(parents=True, exist_ok=True)
+            for res_file in part_res_dir.iterdir():
+                if not res_file.is_file():
+                    continue
+                new_name = f"{part_stem}_{res_file.name}"
+                dest = target_res_dir / new_name
+                if not dest.exists():
+                    shutil.copy2(res_file, dest)
+
         part_items: list[dict] = []
+        part_invalid = False
         for item in data:
             if not isinstance(item, dict):
-                invalid_parts.append(part_stem)
                 logger.warning("分片 %s content_list 项格式异常：存在非 dict 项", part_stem)
-                part_items = []
+                part_invalid = True
                 break
             page_idx = item.get("page_idx")
             if page_idx is not None and not isinstance(page_idx, int):
-                invalid_parts.append(part_stem)
                 logger.warning("分片 %s content_list 项格式异常：page_idx 非 int", part_stem)
-                part_items = []
+                part_invalid = True
                 break
             item_copy = dict(item)
             if isinstance(page_idx, int):
@@ -246,7 +262,8 @@ def merge_content_list_parts(
             if isinstance(item_copy.get("img_path"), str):
                 item_copy["img_path"] = _rewrite_img_path(item_copy["img_path"], part_stem)
             part_items.append(item_copy)
-        if not part_items and data:
+        if part_invalid:
+            invalid_parts.append(part_stem)
             continue
         merged_list.extend(part_items)
 

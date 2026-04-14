@@ -46,6 +46,9 @@ class DoneRecord:
         if entry.get("status") not in self._DONE_STATUSES:
             return False
         if self.parser_version is None:
+            logger.warning(
+                "parser_version 未设置，跳过版本校验，已完成记录将被视为有效: %s", pdf_name
+            )
             return True
         return entry.get("parser_version") == self.parser_version
 
