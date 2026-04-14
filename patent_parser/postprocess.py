@@ -261,17 +261,25 @@ _MATERIAL_HINT_RE = re.compile(
 class _SimpleHTMLTableParser(HTMLParser):
     """支持嵌套表格的轻量解析器（忽略嵌套表格内容）。"""
 
-    def __init__(self):
+    def __init__(self, block_id: str | None = None):
         super().__init__()
         self.rows: list[list[dict]] = []
         self._current_row: list[dict] | None = None
         self._current_cell: dict | None = None
         self._in_cell = False
         self._table_depth = 0
+        self._nested_table_logged = False
+        self._block_id = block_id
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
             self._table_depth += 1
+            if self._table_depth > 1 and not self._nested_table_logged:
+                if self._block_id:
+                    logger.debug("忽略嵌套表格内容: %s", self._block_id)
+                else:
+                    logger.debug("忽略嵌套表格内容")
+                self._nested_table_logged = True
             return
         if self._table_depth > 1:
             return
@@ -310,8 +318,8 @@ class _SimpleHTMLTableParser(HTMLParser):
             self._current_cell["text"] += data
 
 
-def _parse_table_html(html: str) -> dict:
-    parser = _SimpleHTMLTableParser()
+def _parse_table_html(html: str, block_id: str | None = None) -> dict:
+    parser = _SimpleHTMLTableParser(block_id=block_id)
     parser.feed(html)
     for row in parser.rows:
         for cell in row:
@@ -930,7 +938,7 @@ def build_structured_json(
             html = item.get("table_body") or item.get("html") or ""
             caption_list = item.get("table_caption", []) or []
             table_id = f"{block_id}_table"
-            table_struct = _parse_table_html(html) if html else {"rows": []}
+            table_struct = _parse_table_html(html, block_id=table_id) if html else {"rows": []}
             for r_idx, row in enumerate(table_struct.get("rows", []), 1):
                 for c_idx, cell in enumerate(row, 1):
                     if not isinstance(cell, dict):

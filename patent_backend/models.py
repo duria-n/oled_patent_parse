@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass(slots=True)
@@ -190,12 +190,57 @@ class StructuredPatentDocument:
                 yield block, relation
 
     def text_for_embedding(self, max_blocks: int = 120) -> str:
+        """按语义优先级拼接文档向量文本。
+
+        规则：标题/摘要 -> 权利要求1 -> 其他权利要求 -> 发明内容(summary) -> 实施例 -> 其余文本。
+        """
         parts: list[str] = []
-        if self.title:
-            parts.append(self.title)
-        if self.abstract:
-            parts.append(self.abstract)
-        for block in self.blocks[:max_blocks]:
-            if block.text:
-                parts.append(block.text)
+        seen_text: set[str] = set()
+        selected_block_ids: set[str] = set()
+
+        def _append_text(text: str | None) -> bool:
+            if text is None:
+                return False
+            cleaned = text.strip()
+            if not cleaned or cleaned in seen_text:
+                return False
+            seen_text.add(cleaned)
+            parts.append(cleaned)
+            return True
+
+        _append_text(self.title)
+        _append_text(self.abstract)
+
+        def _is_claim(block: BlockRecord) -> bool:
+            return block.block_type.startswith("claim") or block.section == "claims"
+
+        def _is_claim_one(block: BlockRecord) -> bool:
+            return _is_claim(block) and block.claim_no == 1
+
+        def _is_summary(block: BlockRecord) -> bool:
+            return block.subsection == "summary"
+
+        def _is_example(block: BlockRecord) -> bool:
+            return bool(block.example_id)
+
+        def _collect(selector: Callable[[BlockRecord], bool]) -> None:
+            if len(selected_block_ids) >= max_blocks:
+                return
+            for block in self.blocks:
+                if len(selected_block_ids) >= max_blocks:
+                    break
+                if block.block_id in selected_block_ids:
+                    continue
+                if not selector(block):
+                    continue
+                if not _append_text(block.text):
+                    continue
+                selected_block_ids.add(block.block_id)
+
+        _collect(_is_claim_one)
+        _collect(_is_claim)
+        _collect(_is_summary)
+        _collect(_is_example)
+        _collect(lambda _block: True)
+
         return "\n".join(parts)

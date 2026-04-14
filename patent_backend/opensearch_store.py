@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from .config import OpenSearchConfig
 from .embedding import BaseEmbedder
@@ -122,61 +122,74 @@ class OpenSearchPatentIndex:
         if not self.client.indices.exists(index=block_index):
             self.client.indices.create(index=block_index, body=block_mapping)
 
-    def index_documents(self, docs: list[StructuredPatentDocument], chunk_size: int = 200) -> None:
-        doc_actions: list[dict[str, Any]] = []
-        block_actions: list[dict[str, Any]] = []
-
+    def _iter_doc_actions(self, docs: list[StructuredPatentDocument]) -> Iterable[dict[str, Any]]:
         for doc in docs:
             full_text = doc.text_for_embedding()
             embedding = self.embedder.embed(full_text)
             entity_types = sorted({entity.entity_type for _, entity in doc.iter_entities()})
             relation_types = sorted({rel.relation_type for _, rel in doc.iter_relations()})
 
-            doc_actions.append(
-                {
-                    "_op_type": "index",
-                    "_index": self.config.index_name,
-                    "_id": doc.doc_id,
-                    "_source": {
-                        "doc_id": doc.doc_id,
-                        "publication_number": doc.publication_number,
-                        "title": doc.title,
-                        "abstract": doc.abstract,
-                        "metadata": doc.metadata,
-                        "entity_types": entity_types,
-                        "relation_types": relation_types,
-                        "full_text": full_text,
-                        "embedding": embedding,
-                    },
-                }
-            )
+            yield {
+                "_op_type": "index",
+                "_index": self.config.index_name,
+                "_id": doc.doc_id,
+                "_source": {
+                    "doc_id": doc.doc_id,
+                    "publication_number": doc.publication_number,
+                    "title": doc.title,
+                    "abstract": doc.abstract,
+                    "metadata": doc.metadata,
+                    "entity_types": entity_types,
+                    "relation_types": relation_types,
+                    "full_text": full_text,
+                    "embedding": embedding,
+                },
+            }
 
+    def _iter_block_actions(self, docs: list[StructuredPatentDocument]) -> Iterable[dict[str, Any]]:
+        for doc in docs:
             for block in doc.blocks:
                 text = block.text or ""
                 if not text.strip():
                     continue
-                block_actions.append(
-                    {
-                        "_op_type": "index",
-                        "_index": self.config.block_index_name,
-                        "_id": block.block_id,
-                        "_source": {
-                            "doc_id": doc.doc_id,
-                            "block_id": block.block_id,
-                            "block_type": block.block_type,
-                            "section": block.section,
-                            "subsection": block.subsection,
-                            "example_id": block.example_id,
-                            "text": text,
-                            "embedding": self.embedder.embed(text),
-                        },
-                    }
-                )
+                yield {
+                    "_op_type": "index",
+                    "_index": self.config.block_index_name,
+                    "_id": block.block_id,
+                    "_source": {
+                        "doc_id": doc.doc_id,
+                        "block_id": block.block_id,
+                        "block_type": block.block_type,
+                        "section": block.section,
+                        "subsection": block.subsection,
+                        "example_id": block.example_id,
+                        "text": text,
+                        "embedding": self.embedder.embed(text),
+                    },
+                }
 
-        if doc_actions:
-            self._bulk(self.client, doc_actions, chunk_size=chunk_size, refresh="wait_for")
-        if block_actions:
-            self._bulk(self.client, block_actions, chunk_size=chunk_size, refresh="wait_for")
+    def _bulk_if_has_actions(self, actions: Iterable[dict[str, Any]], chunk_size: int) -> None:
+        action_iter = iter(actions)
+        try:
+            first = next(action_iter)
+        except StopIteration:
+            return
+
+        def _with_first() -> Iterable[dict[str, Any]]:
+            yield first
+            yield from action_iter
+
+        self._bulk(self.client, _with_first(), chunk_size=chunk_size, refresh="wait_for")
+
+    def index_documents(self, docs: list[StructuredPatentDocument], chunk_size: int = 200) -> None:
+        self._bulk_if_has_actions(
+            self._iter_doc_actions(docs),
+            chunk_size=chunk_size,
+        )
+        self._bulk_if_has_actions(
+            self._iter_block_actions(docs),
+            chunk_size=chunk_size,
+        )
 
     def hybrid_search_documents(
         self,
